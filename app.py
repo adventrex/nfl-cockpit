@@ -98,8 +98,55 @@ except ImportError as e:
     st.stop()
 
 # ==========================================
-# 3. STADIUM & WEATHER SERVICE (RESTORED)
+# 3. SECONDARY DATA SOURCES
 # ==========================================
+class OddsService:
+    # Map API Team Names to nflverse Abbreviations
+    TEAM_MAP = {
+        "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
+        "Carolina Panthers": "CAR", "Chicago Bears": "CHI", "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
+        "Dallas Cowboys": "DAL", "Denver Broncos": "DEN", "Detroit Lions": "DET", "Green Bay Packers": "GB",
+        "Houston Texans": "HOU", "Indianapolis Colts": "IND", "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
+        "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC", "Los Angeles Rams": "LA", "Miami Dolphins": "MIA",
+        "Minnesota Vikings": "MIN", "New England Patriots": "NE", "New Orleans Saints": "NO", "New York Giants": "NYG",
+        "New York Jets": "NYJ", "Philadelphia Eagles": "PHI", "Pittsburgh Steelers": "PIT", "San Francisco 49ers": "SF",
+        "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB", "Tennessee Titans": "TEN", "Washington Commanders": "WAS"
+    }
+
+    @staticmethod
+    @st.cache_data(ttl=3600)
+    def fetch_live_odds():
+        try:
+            url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?regions=us&markets=h2h&bookmakers=draftkings&apiKey={ODDS_API_KEY}"
+            response = requests.get(url)
+            data = response.json()
+            
+            live_data = {}
+            
+            for game in data:
+                h_name = game.get('home_team')
+                a_name = game.get('away_team')
+                h_abbr = OddsService.TEAM_MAP.get(h_name)
+                a_abbr = OddsService.TEAM_MAP.get(a_name)
+                
+                if h_abbr and a_abbr and game['bookmakers']:
+                    dk = game['bookmakers'][0]
+                    outcomes = dk['markets'][0]['outcomes']
+                    h_price, a_price = None, None
+                    
+                    for outcome in outcomes:
+                        if outcome['name'] == h_name: h_price = outcome['price']
+                        elif outcome['name'] == a_name: a_price = outcome['price']
+                    
+                    def dec_to_amer(dec):
+                        if dec >= 2.0: return int((dec - 1) * 100)
+                        else: return int(-100 / (dec - 1))
+                        
+                    if h_price and a_price:
+                        live_data[(h_abbr, a_abbr)] = {'home_am': dec_to_amer(h_price), 'away_am': dec_to_amer(a_price)}
+            return live_data
+        except: return {}
+
 class StadiumService:
     # Map Team to (Lat, Lon, Type). Type: 'open', 'dome', 'retractable'
     STADIUMS = {
@@ -167,50 +214,7 @@ class StadiumService:
         return {"desc": "Weather Unavailable", "is_closed": False, "temp": 70, "wind": 5, "rain": 0}
 
 # ==========================================
-# 4. SECONDARY DATA SOURCES
-# ==========================================
-class OddsService:
-    TEAM_MAP = {
-        "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
-        "Carolina Panthers": "CAR", "Chicago Bears": "CHI", "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
-        "Dallas Cowboys": "DAL", "Denver Broncos": "DEN", "Detroit Lions": "DET", "Green Bay Packers": "GB",
-        "Houston Texans": "HOU", "Indianapolis Colts": "IND", "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
-        "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC", "Los Angeles Rams": "LA", "Miami Dolphins": "MIA",
-        "Minnesota Vikings": "MIN", "New England Patriots": "NE", "New Orleans Saints": "NO", "New York Giants": "NYG",
-        "New York Jets": "NYJ", "Philadelphia Eagles": "PHI", "Pittsburgh Steelers": "PIT", "San Francisco 49ers": "SF",
-        "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB", "Tennessee Titans": "TEN", "Washington Commanders": "WAS"
-    }
-
-    @staticmethod
-    @st.cache_data(ttl=3600)
-    def fetch_live_odds():
-        try:
-            url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?regions=us&markets=h2h&bookmakers=draftkings&apiKey={ODDS_API_KEY}"
-            response = requests.get(url)
-            data = response.json()
-            live_data = {}
-            for game in data:
-                h_name = game.get('home_team')
-                a_name = game.get('away_team')
-                h_abbr = OddsService.TEAM_MAP.get(h_name)
-                a_abbr = OddsService.TEAM_MAP.get(a_name)
-                if h_abbr and a_abbr and game['bookmakers']:
-                    dk = game['bookmakers'][0]
-                    outcomes = dk['markets'][0]['outcomes']
-                    h_price, a_price = None, None
-                    for outcome in outcomes:
-                        if outcome['name'] == h_name: h_price = outcome['price']
-                        elif outcome['name'] == a_name: a_price = outcome['price']
-                    def dec_to_amer(dec):
-                        if dec >= 2.0: return int((dec - 1) * 100)
-                        else: return int(-100 / (dec - 1))
-                    if h_price and a_price:
-                        live_data[(h_abbr, a_abbr)] = {'home_am': dec_to_amer(h_price), 'away_am': dec_to_amer(a_price)}
-            return live_data
-        except: return {}
-
-# ==========================================
-# 5. MATH HELPERS
+# 4. MATH HELPERS
 # ==========================================
 def american_to_decimal(odds):
     try: odds = float(odds)
@@ -243,7 +247,7 @@ def get_last_nfl_date():
     return today
 
 # ==========================================
-# 6. DATA LOADER
+# 5. DATA LOADER
 # ==========================================
 @st.cache_resource(ttl=3600)
 def load_nfl_data():
@@ -310,7 +314,11 @@ def load_nfl_data():
         team_stats['avg_rush_def'] = team_stats['rush_yds_def'] / team_stats['games']
         team_stats['avg_tos_def'] = (team_stats['def_int'] + team_stats['def_fumbles']) / team_stats['games']
         
-        team_stats['epa_net'] = (team_stats['epa_pass_off'] - team_stats['epa_pass_def']) + (team_stats['epa_rush_off'] - team_stats['epa_rush_def'])
+        # Calculate NET EPA for Model Training (Corrected)
+        # Net Pass = Offense - Defense
+        # Net Rush = Offense - Defense
+        team_stats['epa_net_pass'] = team_stats['epa_pass_off'] - team_stats['epa_pass_def']
+        team_stats['epa_net_rush'] = team_stats['epa_rush_off'] - team_stats['epa_rush_def']
         
         if 'cpoe' not in pbp.columns: pbp['cpoe'] = 0.0
         qb_stats = pbp[pbp['play_type']=='pass'].groupby(['season', 'posteam', 'passer_player_name']).agg(
@@ -329,17 +337,16 @@ def load_nfl_data():
             games_train = games_train.merge(team_stats.add_prefix("home_"), left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
             games_train = games_train.merge(team_stats.add_prefix("away_"), left_on=["season", "away_team"], right_on=["away_season", "away_team"], how="left")
             
-            games_train["diff_pass_off"] = games_train["home_epa_pass_off"] - games_train["away_epa_pass_def"]
-            games_train["diff_rush_off"] = games_train["home_epa_rush_off"] - games_train["away_epa_rush_def"]
-            games_train["diff_pass_def"] = games_train["home_epa_pass_def"] - games_train["away_epa_pass_off"]
-            games_train["diff_rush_def"] = games_train["home_epa_rush_def"] - games_train["away_epa_rush_off"]
+            # CORRECTED MODEL FEATURES: Home Net - Away Net
+            games_train["diff_net_pass"] = games_train["home_epa_net_pass"] - games_train["away_epa_net_pass"]
+            games_train["diff_net_rush"] = games_train["home_epa_net_rush"] - games_train["away_epa_net_rush"]
             
             def get_logit(r):
                 try: return logit(no_vig_two_way(american_to_decimal(r['home_moneyline']), american_to_decimal(r['away_moneyline']))[0])
                 except: return np.nan
             games_train['logit_mkt'] = games_train.apply(get_logit, axis=1)
             
-            features = ['logit_mkt', 'diff_pass_off', 'diff_rush_off', 'diff_pass_def', 'diff_rush_def']
+            features = ['logit_mkt', 'diff_net_pass', 'diff_net_rush']
             train_clean = games_train.dropna(subset=['home_win'] + features)
             if not train_clean.empty:
                 clf = LogisticRegression()
@@ -428,6 +435,8 @@ class CockpitEngine:
             if not h.empty:
                 s_def['h_qb'] = epa_to_10(h['epa_pass_off'].values[0])
                 s_def['h_pwr'] = epa_to_10(h['epa_rush_off'].values[0])
+                # Avg defense = Pass Def + Rush Def / 2
+                # But we want Net Rating. For Defense slider, higher = better defense (lower EPA)
                 avg_def_epa = (h['epa_pass_def'].values[0] + h['epa_rush_def'].values[0]) / 2
                 s_def['h_def'] = epa_to_10(avg_def_epa, reverse=True)
             if not a.empty:
@@ -464,26 +473,60 @@ class CockpitEngine:
     def calc_win_prob(market_prob, row, sliders):
         logit_mkt = logit(market_prob)
         def s_to_epa(val): return (val - 5) * 0.03 
+        
+        # Convert sliders to EPA adjustments
         h_pass = s_to_epa(sliders['ph_qb'])
         h_rush = s_to_epa(sliders['ph_pwr'])
-        h_def  = s_to_epa(sliders['ph_def']) * -1 
+        h_def_val  = s_to_epa(sliders['ph_def']) # Positive slider = Positive Value (Good)
+        # Net Logic: Good Defense reduces opponent EPA. 
+        # So High Defense Slider -> More Negative EPA Allowed.
+        # Correction: Slider 10 -> +0.15 value. We subtract this from Opponent EPA.
+        
         a_pass = s_to_epa(sliders['pa_qb'])
         a_rush = s_to_epa(sliders['pa_pwr'])
-        a_def  = s_to_epa(sliders['pa_def']) * -1
-        d_pass_off = h_pass - a_def
-        d_rush_off = h_rush - a_def 
-        d_pass_def = h_def - a_pass
-        d_rush_def = h_def - a_rush
+        a_def_val  = s_to_epa(sliders['pa_def'])
+
+        # CALCULATE NET EPA DIFF FOR MODEL (Home - Away)
+        # Model trained on: (Home_Net_Pass - Away_Net_Pass) and (Home_Net_Rush - Away_Net_Rush)
+        
+        # Home Net Pass = (Home Pass Offense + User Adj) - (Home Pass Defense - User Adj)
+        # Actually simpler: Just map Sliders directly to the Diffs the model expects.
+        # Model Feat 1: diff_net_pass (Home Pass Advantage)
+        # Model Feat 2: diff_net_rush (Home Rush Advantage)
+        
+        # If Home QB Slider is high -> Home Pass Adv goes UP.
+        # If Away QB Slider is high -> Home Pass Adv goes DOWN.
+        # If Home Def Slider is high -> Home Pass Adv goes UP (because we stop them).
+        # If Away Def Slider is high -> Home Pass Adv goes DOWN.
+        
+        # Net Pass Diff Adjustment = (HomeQB - AwayQB) + (HomeDef - AwayDef)
+        adj_net_pass = (h_pass - a_pass) + (h_def_val - a_def_val)
+        
+        # Net Rush Diff Adjustment
+        adj_net_rush = (h_rush - a_rush) + (h_def_val - a_def_val)
+        
+        # Get Base Stats
+        base_diff_pass, base_diff_rush = 0.0, 0.0
+        if not team_stats_db.empty:
+            h = team_stats_db[(team_stats_db['team']==row['home_team'])].sort_values('season', ascending=False).head(1)
+            a = team_stats_db[(team_stats_db['team']==row['away_team'])].sort_values('season', ascending=False).head(1)
+            if not h.empty and not a.empty:
+                base_diff_pass = h['epa_net_pass'].values[0] - a['epa_net_pass'].values[0]
+                base_diff_rush = h['epa_net_rush'].values[0] - a['epa_net_rush'].values[0]
+
         model_p = market_prob
         if model_clf:
-            x = pd.DataFrame([[logit_mkt, d_pass_off, d_rush_off, d_pass_def, d_rush_def]], 
-                           columns=['logit_mkt', 'diff_pass_off', 'diff_rush_off', 'diff_pass_def', 'diff_rush_def'])
+            x = pd.DataFrame([[logit_mkt, base_diff_pass + adj_net_pass, base_diff_rush + adj_net_rush]], 
+                           columns=['logit_mkt', 'diff_net_pass', 'diff_net_rush'])
             model_raw = model_clf.predict_proba(x)[0, 1]
             model_p = (0.7 * market_prob) + (0.3 * model_raw)
+
         news = (random.uniform(-0.04, 0.04)) * (sliders['wn']/2.5) if sliders['wn']>0 else 0
         weather = -0.02 * (sliders['ww']/2.5) if sliders['ww']>0 else 0
         rest = ((sliders.get('rh',7)-sliders.get('ra',7))*0.005) * (sliders['wr']/2.0)
+        
         final = min(max(model_p + news + weather + rest, 0.01), 0.99)
+        
         return final, {"AI Model (Stats)": model_p, "News Variance": news, "Weather Penalty": weather, "Rest Advantage": rest}
 
 # ==========================================
