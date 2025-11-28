@@ -6,6 +6,7 @@ import math
 import random
 import requests
 import streamlit.components.v1 as components
+from math import erf, sqrt
 
 # ==========================================
 # 1. UI CONFIGURATION
@@ -236,6 +237,9 @@ def half_kelly(p, d, cap=0.05):
 def logit(p):
     return math.log(max(p, 1e-6) / (1 - max(p, 1e-6)))
 
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
 def get_last_nfl_date():
     today = datetime.date.today()
     offset = 0
@@ -246,18 +250,65 @@ def get_last_nfl_date():
         if offset > 7: break 
     return today
 
+def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
+    """
+    Calculates specific Home Field Advantage per team using Log-Odds ratio.
+    Returns a dictionary mapping Team -> HFA Probability Bonus (e.g. 0.03)
+    """
+    df = games.copy()
+    # Ensure numeric
+    df = df.dropna(subset=['home_score', 'away_score'])
+    df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
+    
+    teams = pd.unique(pd.concat([df["home_team"], df["away_team"]]))
+    hfa_map = {}
+
+    for team in teams:
+        g_home = df[df["home_team"] == team]
+        g_away = df[df["away_team"] == team]
+
+        n_home = len(g_home)
+        n_away = len(g_away)
+
+        if n_home < min_games or n_away < min_games:
+            hfa_map[team] = 0.0
+            continue
+
+        w_home = g_home["home_win"].sum()
+        # Away win = home loss for those games
+        w_away = (1 - g_away["home_win"]).sum()
+
+        # Smoothed proportions
+        p_home = (w_home + smooth) / (n_home + 2 * smooth)
+        p_away = (w_away + smooth) / (n_away + 2 * smooth)
+
+        # Log-odds
+        l_home = np.log(p_home / (1.0 - p_home))
+        l_away = np.log(p_away / (1.0 - p_away))
+        delta = l_home - l_away
+        
+        # FIXED: Directly convert delta to probability bump without strict significance check
+        # This ensures we get a value even if it's not statistically "perfect" (better UX for sliders)
+        home_prob_equal = 1.0 / (1.0 + np.exp(-delta / 2.0))
+        hfa_map[team] = home_prob_equal - 0.5
+            
+    return hfa_map
+
 # ==========================================
-# 5. DATA LOADER
+# 5. DATA LOADER (MIXED: 2023-2024-2025)
 # ==========================================
 @st.cache_resource(ttl=3600)
 def load_nfl_data():
     current_year = datetime.date.today().year
     if datetime.date.today().month < 3: current_year -= 1
+    
     last_played_date = get_last_nfl_date()
     
+    # 1. SCHEDULE (Force 2025)
     sched = pd.DataFrame()
     try: sched = nfl.import_schedules([current_year])
     except: pass
+
     if sched.empty:
         try:
             sched = nfl.import_schedules([current_year - 1])
@@ -266,27 +317,54 @@ def load_nfl_data():
             sched['gameday'] = sched['gameday'].dt.strftime('%Y-%m-%d')
         except: pass
 
+    # 2. HFA DATA (Last 3 Years - Dedicated)
+    hfa_dict = {}
+    try:
+        hfa_years = [current_year - 3, current_year - 2, current_year - 1]
+        sched_hfa = nfl.import_schedules(hfa_years)
+        hfa_dict = compute_team_home_advantage(sched_hfa)
+    except: pass
+
+    # 3. STATS - ROBUST MIX (2023, 2024, 2025)
     pbp_all = []
     weekly_all = []
-    train_years = [current_year - 1, current_year]
     
-    try:
-        pbp = nfl.import_pbp_data(train_years, cache=False)
-        weekly = nfl.import_weekly_data(train_years)
-    except:
+    # Loop through desired years and grab what we can
+    target_years = [current_year - 2, current_year - 1, current_year]
+    
+    for year in target_years:
         try:
-            train_years = [current_year - 2, current_year - 1]
-            pbp = nfl.import_pbp_data(train_years, cache=False)
-            weekly = nfl.import_weekly_data(train_years)
+            # Try Library First
+            p = nfl.import_pbp_data([year], cache=False)
+            w = nfl.import_weekly_data([year])
+            
+            if not p.empty:
+                pbp_all.append(p)
+                weekly_all.append(w)
+            elif year == current_year:
+                # If 2025 library fails, try Direct URL
+                raise ValueError("Library empty for current year")
         except:
-            pbp, weekly = pd.DataFrame(), pd.DataFrame()
+            if year == current_year:
+                print(f"Attempting Force Fetch for {year}...")
+                try:
+                    url = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{year}.csv.gz"
+                    p_direct = pd.read_csv(url, compression='gzip', low_memory=False)
+                    if not p_direct.empty:
+                        pbp_all.append(p_direct)
+                except:
+                    print(f"Could not load {year} data.")
+
+    pbp = pd.concat(pbp_all) if pbp_all else pd.DataFrame()
+    weekly = pd.concat(weekly_all) if weekly_all else pd.DataFrame()
 
     clf = None
     team_stats = pd.DataFrame()
     qb_stats = pd.DataFrame()
-    loaded_year = current_year
+    loaded_year = pbp['season'].max() if not pbp.empty else current_year - 1
     
     if not pbp.empty:
+        # Feature Engineering
         pass_plays = pbp[pbp["play_type"] == "pass"]
         run_plays = pbp[pbp["play_type"] == "run"]
         
@@ -314,9 +392,6 @@ def load_nfl_data():
         team_stats['avg_rush_def'] = team_stats['rush_yds_def'] / team_stats['games']
         team_stats['avg_tos_def'] = (team_stats['def_int'] + team_stats['def_fumbles']) / team_stats['games']
         
-        # Calculate NET EPA for Model Training (Corrected)
-        # Net Pass = Offense - Defense
-        # Net Rush = Offense - Defense
         team_stats['epa_net_pass'] = team_stats['epa_pass_off'] - team_stats['epa_pass_def']
         team_stats['epa_net_rush'] = team_stats['epa_rush_off'] - team_stats['epa_rush_def']
         
@@ -327,6 +402,7 @@ def load_nfl_data():
             dropbacks=('play_id', 'count')
         ).reset_index().sort_values('dropbacks', ascending=False).drop_duplicates(['season', 'posteam'])
 
+        # Training (Use available data)
         games_train = sched.dropna(subset=['home_score', 'home_moneyline']).copy()
         if not games_train.empty:
             games_train['gameday_dt'] = pd.to_datetime(games_train['gameday'])
@@ -337,7 +413,6 @@ def load_nfl_data():
             games_train = games_train.merge(team_stats.add_prefix("home_"), left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
             games_train = games_train.merge(team_stats.add_prefix("away_"), left_on=["season", "away_team"], right_on=["away_season", "away_team"], how="left")
             
-            # CORRECTED MODEL FEATURES: Home Net - Away Net
             games_train["diff_net_pass"] = games_train["home_epa_net_pass"] - games_train["away_epa_net_pass"]
             games_train["diff_net_rush"] = games_train["home_epa_net_rush"] - games_train["away_epa_net_rush"]
             
@@ -354,25 +429,28 @@ def load_nfl_data():
         
         loaded_year = pbp['season'].max()
 
-    return clf, team_stats, weekly, sched, qb_stats, loaded_year
+    return clf, team_stats, weekly, sched, qb_stats, loaded_year, hfa_dict
 
 # LOAD SEQUENCE
 loading_placeholder.empty()
 with loading_placeholder:
     components.html(LOADING_HTML, height=450)
 
-model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, sched_source = load_nfl_data()
+model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, sched_source, hfa_db = load_nfl_data()
 live_odds_map = OddsService.fetch_live_odds()
 
 loading_placeholder.empty()
 
 status_slot.success(f"Active Season: {sched_source}")
+status_slot.info(f"Data Up To: {get_last_nfl_date()}")
+if hfa_db: status_slot.caption("HFA Data: 3 Years Loaded")
+
 if sched_db is None or sched_db.empty:
     st.error("Unable to load NFL Schedule. Check connection.")
     st.stop()
 
 # ==========================================
-# 7. LOGIC ENGINE
+# 6. LOGIC ENGINE
 # ==========================================
 class CockpitEngine:
     @staticmethod
@@ -404,8 +482,8 @@ class CockpitEngine:
         h_lead = CockpitEngine.get_team_leaders(home)
         a_lead = CockpitEngine.get_team_leaders(away)
         props = []
-        props.append(parlay.PropLeg(f"{home}_ML", f"{home} To Win", 1.91, h_win_prob, "Team Win", home, "Moneyline"))
-        props.append(parlay.PropLeg(f"{away}_ML", f"{away} To Win", 1.91, a_win_prob, "Team Win", away, "Moneyline"))
+        props.append(parlay.PropLeg(f"{home}_ML", f"{home} To Win", 1.0 + (1/h_win_prob), h_win_prob, "Team Win", home, "Moneyline"))
+        props.append(parlay.PropLeg(f"{away}_ML", f"{away} To Win", 1.0 + (1/a_win_prob), a_win_prob, "Team Win", away, "Moneyline"))
 
         def add(p_data, cat, team, m=1.0):
             if not p_data: return
@@ -423,7 +501,7 @@ class CockpitEngine:
 
     @staticmethod
     def get_default_sliders(row, weather_data):
-        s_def = {'h_qb': 5, 'h_pwr': 5, 'h_def': 5, 'a_qb': 5, 'a_pwr': 5, 'a_def': 5, 'rest': 2, 'news': 2, 'weath': 0}
+        s_def = {'h_qb': 5, 'h_pwr': 5, 'h_def': 5, 'a_qb': 5, 'a_pwr': 5, 'a_def': 5, 'rest': 2, 'news': 2, 'weath': 0, 'hfa': 5}
         if not team_stats_db.empty:
             h_team, a_team = row['home_team'], row['away_team']
             h = team_stats_db[(team_stats_db['team']==h_team)].sort_values('season', ascending=False).head(1)
@@ -435,8 +513,6 @@ class CockpitEngine:
             if not h.empty:
                 s_def['h_qb'] = epa_to_10(h['epa_pass_off'].values[0])
                 s_def['h_pwr'] = epa_to_10(h['epa_rush_off'].values[0])
-                # Avg defense = Pass Def + Rush Def / 2
-                # But we want Net Rating. For Defense slider, higher = better defense (lower EPA)
                 avg_def_epa = (h['epa_pass_def'].values[0] + h['epa_rush_def'].values[0]) / 2
                 s_def['h_def'] = epa_to_10(avg_def_epa, reverse=True)
             if not a.empty:
@@ -444,6 +520,11 @@ class CockpitEngine:
                 s_def['a_pwr'] = epa_to_10(a['epa_rush_off'].values[0])
                 avg_def_epa = (a['epa_pass_def'].values[0] + a['epa_rush_def'].values[0]) / 2
                 s_def['a_def'] = epa_to_10(avg_def_epa, reverse=True)
+        
+        # HFA Smart Default
+        hfa_val = hfa_db.get(row['home_team'], 0.0)
+        hfa_ticks = hfa_val / 0.015
+        s_def['hfa'] = int(min(max(5 + hfa_ticks, 0), 10))
 
         rest_h = row.get('home_rest', 7)
         rest_a = row.get('away_rest', 7)
@@ -473,39 +554,16 @@ class CockpitEngine:
     def calc_win_prob(market_prob, row, sliders):
         logit_mkt = logit(market_prob)
         def s_to_epa(val): return (val - 5) * 0.03 
-        
-        # Convert sliders to EPA adjustments
         h_pass = s_to_epa(sliders['ph_qb'])
         h_rush = s_to_epa(sliders['ph_pwr'])
-        h_def_val  = s_to_epa(sliders['ph_def']) # Positive slider = Positive Value (Good)
-        # Net Logic: Good Defense reduces opponent EPA. 
-        # So High Defense Slider -> More Negative EPA Allowed.
-        # Correction: Slider 10 -> +0.15 value. We subtract this from Opponent EPA.
-        
+        h_def_val = s_to_epa(sliders['ph_def'])
         a_pass = s_to_epa(sliders['pa_qb'])
         a_rush = s_to_epa(sliders['pa_pwr'])
-        a_def_val  = s_to_epa(sliders['pa_def'])
+        a_def_val = s_to_epa(sliders['pa_def'])
 
-        # CALCULATE NET EPA DIFF FOR MODEL (Home - Away)
-        # Model trained on: (Home_Net_Pass - Away_Net_Pass) and (Home_Net_Rush - Away_Net_Rush)
-        
-        # Home Net Pass = (Home Pass Offense + User Adj) - (Home Pass Defense - User Adj)
-        # Actually simpler: Just map Sliders directly to the Diffs the model expects.
-        # Model Feat 1: diff_net_pass (Home Pass Advantage)
-        # Model Feat 2: diff_net_rush (Home Rush Advantage)
-        
-        # If Home QB Slider is high -> Home Pass Adv goes UP.
-        # If Away QB Slider is high -> Home Pass Adv goes DOWN.
-        # If Home Def Slider is high -> Home Pass Adv goes UP (because we stop them).
-        # If Away Def Slider is high -> Home Pass Adv goes DOWN.
-        
-        # Net Pass Diff Adjustment = (HomeQB - AwayQB) + (HomeDef - AwayDef)
         adj_net_pass = (h_pass - a_pass) + (h_def_val - a_def_val)
-        
-        # Net Rush Diff Adjustment
         adj_net_rush = (h_rush - a_rush) + (h_def_val - a_def_val)
         
-        # Get Base Stats
         base_diff_pass, base_diff_rush = 0.0, 0.0
         if not team_stats_db.empty:
             h = team_stats_db[(team_stats_db['team']==row['home_team'])].sort_values('season', ascending=False).head(1)
@@ -525,9 +583,10 @@ class CockpitEngine:
         weather = -0.02 * (sliders['ww']/2.5) if sliders['ww']>0 else 0
         rest = ((sliders.get('rh',7)-sliders.get('ra',7))*0.005) * (sliders['wr']/2.0)
         
-        final = min(max(model_p + news + weather + rest, 0.01), 0.99)
-        
-        return final, {"AI Model (Stats)": model_p, "News Variance": news, "Weather Penalty": weather, "Rest Advantage": rest}
+        hfa_boost = (sliders['hfa'] - 5) * 0.015
+
+        final = min(max(model_p + news + weather + rest + hfa_boost, 0.01), 0.99)
+        return final, {"AI Model (Stats)": model_p, "News Variance": news, "Weather Penalty": weather, "Rest Advantage": rest, "Home Field": hfa_boost}
 
 # ==========================================
 # 8. UI RENDERERS
@@ -598,15 +657,16 @@ def render_game_card(i, row, bankroll, kelly):
             ph_def = st.slider(f"Defense", 0, 10, defs['h_def'], key=f"ph_def_{i}")
             
         st.markdown("##### Context")
-        cc1, cc2, cc3 = st.columns(3)
+        cc1, cc2, cc3, cc4 = st.columns(4)
         wr = cc1.slider("Rest", 0, 10, defs['rest'], key=f"wr_{i}")
         wn = cc2.slider("News", 0, 10, defs['news'], key=f"wn_{i}")
+        hfa = cc3.slider("Home Field", 0, 10, defs['hfa'], help="Boost for Home Field Advantage (Auto-calc from history)", key=f"hfa_{i}")
         weather_disable = weather_info and weather_info['is_closed']
-        ww = cc3.slider("Weather", 0, 10, defs['weath'], disabled=weather_disable, key=f"ww_{i}")
-        if weather_disable: cc3.caption("🔒 Indoor Stadium")
+        ww = cc4.slider("Weather", 0, 10, defs['weath'], disabled=weather_disable, key=f"ww_{i}")
+        if weather_disable: cc4.caption("🔒 Indoor Stadium")
 
         with c_res:
-            sliders = {'pa_qb': pa_qb, 'pa_pwr': pa_pwr, 'pa_def': pa_def, 'ph_qb': ph_qb, 'ph_pwr': ph_pwr, 'ph_def': ph_def, 'wr': wr, 'wn': wn, 'ww': ww, 'rh': row.get('home_rest',7), 'ra': row.get('away_rest',7)}
+            sliders = {'pa_qb': pa_qb, 'pa_pwr': pa_pwr, 'pa_def': pa_def, 'ph_qb': ph_qb, 'ph_pwr': ph_pwr, 'ph_def': ph_def, 'wr': wr, 'wn': wn, 'ww': ww, 'hfa': hfa, 'rh': row.get('home_rest',7), 'ra': row.get('away_rest',7)}
             final_p, breakdown = CockpitEngine.calc_win_prob(pmkt, row, sliders)
             ev = final_p * dh - 1
             st.markdown("##### 🚀 Verdict")
