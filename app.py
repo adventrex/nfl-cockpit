@@ -265,14 +265,16 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
         if n_home < min_games or n_away < min_games:
             hfa_map[team] = 0.0
             continue
-
         w_home = g_home["home_win"].sum()
-        w_away = (1 - g_away["home_win"]).sum()
         p_home = (w_home + smooth) / (n_home + 2 * smooth)
-        p_away = (w_away + smooth) / (n_away + 2 * smooth)
         l_home = np.log(p_home / (1.0 - p_home))
+        
+        w_away = (1 - g_away["home_win"]).sum() # Away wins
+        p_away = (w_away + smooth) / (n_away + 2 * smooth)
         l_away = np.log(p_away / (1.0 - p_away))
+        
         delta = l_home - l_away
+        # Return Raw HFA probability bump
         home_prob_equal = 1.0 / (1.0 + np.exp(-delta / 2.0))
         hfa_map[team] = home_prob_equal - 0.5
             
@@ -307,34 +309,46 @@ def load_nfl_data():
         hfa_dict = compute_team_home_advantage(sched_hfa)
     except: pass
 
-    # 3. STATS
+    # 3. STATS - ROBUST MIX (WEIGHTED)
     pbp_all = []
     weekly_all = []
     loaded_years = []
-    target_years = [current_year - 2, current_year - 1, current_year]
     
-    for year in target_years:
-        try:
-            p = nfl.import_pbp_data([year], cache=False)
-            w = nfl.import_weekly_data([year])
-            if not p.empty:
-                pbp_all.append(p)
-                weekly_all.append(w)
-                loaded_years.append(year)
-            elif year == current_year:
-                raise ValueError("Library empty")
-        except:
-            if year == current_year:
-                try:
-                    url = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{year}.csv.gz"
-                    p_direct = pd.read_csv(url, compression='gzip', low_memory=False)
-                    if not p_direct.empty:
-                        pbp_all.append(p_direct)
-                        loaded_years.append(year)
-                except: pass
+    # Load 2023-2024 (Base)
+    try:
+        pbp_prev = nfl.import_pbp_data([current_year - 2, current_year - 1], cache=False)
+        pbp_prev['weight'] = 0.5 if 'season' in pbp_prev.columns else 1.0 # Lower weight for old data
+        if 'season' in pbp_prev.columns:
+            pbp_prev.loc[pbp_prev['season'] == current_year - 1, 'weight'] = 1.0
+            
+        weekly_prev = nfl.import_weekly_data([current_year - 2, current_year - 1])
+        pbp_all.append(pbp_prev)
+        weekly_all.append(weekly_prev)
+        loaded_years.extend([current_year - 2, current_year - 1])
+    except: pass
 
-    pbp = pd.concat(pbp_all) if pbp_all else pd.DataFrame()
-    weekly = pd.concat(weekly_all) if weekly_all else pd.DataFrame()
+    # Load 2025 (Current) - High Weight
+    try:
+        pbp_curr = nfl.import_pbp_data([current_year], cache=False)
+        pbp_curr['weight'] = 3.0 # High priority for current season
+        weekly_curr = nfl.import_weekly_data([current_year])
+        if not pbp_curr.empty:
+            pbp_all.append(pbp_curr)
+            weekly_all.append(weekly_curr)
+            loaded_years.append(current_year)
+        else:
+             # Fallback direct URL if library empty
+             url = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{current_year}.csv.gz"
+             p_direct = pd.read_csv(url, compression='gzip', low_memory=False)
+             p_direct['weight'] = 3.0
+             if not p_direct.empty:
+                 pbp_all.append(p_direct)
+                 loaded_years.append(current_year)
+                 # Try to get weekly data too, or simulate it? Just skip weekly for fallback
+    except: pass
+
+    pbp = pd.concat(pbp_all, ignore_index=True) if pbp_all else pd.DataFrame()
+    weekly = pd.concat(weekly_all, ignore_index=True) if weekly_all else pd.DataFrame()
 
     clf = None
     team_stats = pd.DataFrame()
@@ -342,6 +356,7 @@ def load_nfl_data():
     loaded_year = current_year
     
     if not pbp.empty:
+        # Feature Engineering
         pass_plays = pbp[pbp["play_type"] == "pass"]
         run_plays = pbp[pbp["play_type"] == "run"]
         
@@ -379,11 +394,14 @@ def load_nfl_data():
             dropbacks=('play_id', 'count')
         ).reset_index().sort_values('dropbacks', ascending=False).drop_duplicates(['season', 'posteam'])
 
+        # Training: Use weighted samples
         games_train = sched.dropna(subset=['home_score', 'home_moneyline']).copy()
-        if not games_train.empty:
-            games_train['gameday_dt'] = pd.to_datetime(games_train['gameday'])
-            games_train = games_train[games_train['gameday_dt'].dt.date <= last_played_date]
+        games_train['gameday_dt'] = pd.to_datetime(games_train['gameday'])
+        games_train = games_train[games_train['gameday_dt'].dt.date <= last_played_date]
         
+        # Apply weights to games (Current season = 3x)
+        games_train['weight'] = games_train['season'].map(lambda s: 3.0 if s == current_year else (1.0 if s == current_year - 1 else 0.5))
+
         if not games_train.empty:
             games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
             games_train = games_train.merge(team_stats.add_prefix("home_"), left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
@@ -401,7 +419,8 @@ def load_nfl_data():
             train_clean = games_train.dropna(subset=['home_win'] + features)
             if not train_clean.empty:
                 clf = LogisticRegression()
-                clf.fit(train_clean[features], train_clean['home_win'])
+                # Weighted Training
+                clf.fit(train_clean[features], train_clean['home_win'], sample_weight=train_clean['weight'])
         
         loaded_year = pbp['season'].max()
 
@@ -412,14 +431,17 @@ loading_placeholder.empty()
 with loading_placeholder:
     components.html(LOADING_HTML, height=450)
 
-model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, sched_source, hfa_db, loaded_years = load_nfl_data()
+model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, sched_source, hfa_db, loaded_years_list = load_nfl_data()
 live_odds_map = OddsService.fetch_live_odds()
 
 loading_placeholder.empty()
 
 st.sidebar.markdown("### 💾 Data Status")
-for y in loaded_years:
-    st.sidebar.caption(f"✅ {y} Season Loaded")
+if loaded_years_list:
+    for y in sorted(list(set(loaded_years_list))):
+        st.sidebar.caption(f"✅ {int(y)} Season Loaded")
+else:
+    st.sidebar.error("No Stats Loaded")
 
 status_slot.info(f"Data Up To: {get_last_nfl_date()}")
 if hfa_db: status_slot.caption("HFA Data: 3 Years Loaded")
@@ -435,16 +457,24 @@ class CockpitEngine:
     @staticmethod
     def get_team_leaders(team_abbr):
         if weekly_stats_db.empty: return {}
-        recent = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr].sort_values('week', ascending=False).head(50)
-        if recent.empty: return {}
+        
+        # Filter for team
+        team_data = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr].copy()
+        if team_data.empty: return {}
+        
+        # Strictly use LAST GAME played by this team
+        last_week = team_data['week'].max()
+        last_game = team_data[team_data['week'] == last_week]
+        
         leaders = {}
-        qb = recent.sort_values('passing_yards', ascending=False).head(1)
+        # Sort by relevant yards in THAT specific game
+        qb = last_game.sort_values('passing_yards', ascending=False).head(1)
         if not qb.empty:
             leaders['QB'] = {'name': qb.iloc[0]['player_display_name'], 'raw_yds': qb.iloc[0]['passing_yards'], 'stat': f"Last: {qb.iloc[0]['passing_yards']} yds"}
-        rb = recent.sort_values('rushing_yards', ascending=False).head(1)
+        rb = last_game.sort_values('rushing_yards', ascending=False).head(1)
         if not rb.empty:
             leaders['RB'] = {'name': rb.iloc[0]['player_display_name'], 'raw_yds': rb.iloc[0]['rushing_yards'], 'stat': f"Last: {rb.iloc[0]['rushing_yards']} yds"}
-        wr = recent.sort_values('receiving_yards', ascending=False).head(1)
+        wr = last_game.sort_values('receiving_yards', ascending=False).head(1)
         if not wr.empty:
             leaders['WR'] = {'name': wr.iloc[0]['player_display_name'], 'raw_yds': wr.iloc[0]['receiving_yards'], 'stat': f"Last: {wr.iloc[0]['receiving_yards']} yds"}
         return leaders
@@ -593,8 +623,6 @@ def render_game_card(i, row, bankroll, kelly):
         if weather_info: c1.caption(f"{weather_info['desc']}")
         with c2:
             st.markdown("**QB Matchup**")
-            st.caption(f"*EPA/Play: Value added per dropback. >0.20 is Elite.*")
-            st.caption(f"*CPOE: Accuracy vs Expectation. Positive is good.*")
             if h_qb is not None and a_qb is not None:
                 edge_txt = "Even"
                 if h_qb['qb_epa'] > a_qb['qb_epa'] + 0.05: edge_txt = f"✅ {h_qb['passer_player_name']}"
@@ -602,7 +630,7 @@ def render_game_card(i, row, bankroll, kelly):
                 st.caption(f"Edge: {edge_txt}")
             else: st.caption("Data Unavailable")
 
-        with st.expander("See QB Efficiency Stats"):
+        with st.expander("See QB Efficiency Stats (EPA & CPOE)"):
             c_qa, c_qh = st.columns(2)
             if a_qb is not None:
                 c_qa.markdown(f"**{a_qb['passer_player_name']}** ({away})")
@@ -625,23 +653,23 @@ def render_game_card(i, row, bankroll, kelly):
 
         with c_away:
             st.markdown(f"##### {away} Adjust")
-            pa_qb = st.slider(f"QB Rating", 0, 10, defs['a_qb'], key=f"pa_qb_{i}", help="0=Bench, 5=Avg, 10=MVP")
-            pa_pwr = st.slider(f"Run/Power", 0, 10, defs['a_pwr'], key=f"pa_pwr_{i}", help="Run Game/O-Line Strength")
-            pa_def = st.slider(f"Defense", 0, 10, defs['a_def'], key=f"pa_def_{i}", help="Ability to stop scores")
+            pa_qb = st.slider(f"QB Rating", 0, 10, defs['a_qb'], key=f"pa_qb_{i}")
+            pa_pwr = st.slider(f"Run/Power", 0, 10, defs['a_pwr'], key=f"pa_pwr_{i}")
+            pa_def = st.slider(f"Defense", 0, 10, defs['a_def'], key=f"pa_def_{i}")
 
         with c_home:
             st.markdown(f"##### {home} Adjust")
-            ph_qb = st.slider(f"QB Rating", 0, 10, defs['h_qb'], key=f"ph_qb_{i}", help="0=Bench, 5=Avg, 10=MVP")
-            ph_pwr = st.slider(f"Run/Power", 0, 10, defs['h_pwr'], key=f"ph_pwr_{i}", help="Run Game/O-Line Strength")
-            ph_def = st.slider(f"Defense", 0, 10, defs['h_def'], key=f"ph_def_{i}", help="Ability to stop scores")
+            ph_qb = st.slider(f"QB Rating", 0, 10, defs['h_qb'], key=f"ph_qb_{i}")
+            ph_pwr = st.slider(f"Run/Power", 0, 10, defs['h_pwr'], key=f"ph_pwr_{i}")
+            ph_def = st.slider(f"Defense", 0, 10, defs['h_def'], key=f"ph_def_{i}")
             
         st.markdown("##### Context")
         cc1, cc2, cc3, cc4 = st.columns(4)
-        wr = cc1.slider("Rest", 0, 10, defs['rest'], key=f"wr_{i}", help="5=Big Advantage (Bye vs Short Week)")
-        wn = cc2.slider("News", 0, 10, defs['news'], key=f"wn_{i}", help="5=Major Injury/Drama")
-        hfa = cc3.slider("Home Field", 0, 10, defs['hfa'], help="Auto-calculated advantage from history", key=f"hfa_{i}")
+        wr = cc1.slider("Rest", 0, 10, defs['rest'], key=f"wr_{i}")
+        wn = cc2.slider("News", 0, 10, defs['news'], key=f"wn_{i}")
+        hfa = cc3.slider("Home Field", 0, 10, defs['hfa'], help="Boost for Home Field Advantage (Auto-calc from history)", key=f"hfa_{i}")
         weather_disable = weather_info and weather_info['is_closed']
-        ww = cc4.slider("Weather", 0, 10, defs['weath'], disabled=weather_disable, key=f"ww_{i}", help="5=Bad Weather (Wind/Rain)")
+        ww = cc4.slider("Weather", 0, 10, defs['weath'], disabled=weather_disable, key=f"ww_{i}")
         if weather_disable: cc4.caption("🔒 Indoor Stadium")
 
         with c_res:
