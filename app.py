@@ -80,6 +80,9 @@ with st.sidebar:
     
     st.divider()
     status_slot = st.empty()
+    
+    # Placeholder for Years Loaded
+    years_slot = st.empty()
 
 # Date Picker
 c_date, c_status = st.columns([1, 3])
@@ -193,9 +196,11 @@ class StadiumService:
         stadium = StadiumService.STADIUMS.get(team_abbr)
         if not stadium: return None
 
+        # If Dome/Retractable, assume closed/good conditions
         if stadium['type'] in ['dome', 'retractable']:
             return {"desc": "🏟️ Stadium Closed/Dome", "is_closed": True, "temp": 72, "wind": 0, "rain": 0}
 
+        # If Open, fetch API
         try:
             date_str = date_obj.strftime("%Y-%m-%d")
             url = f"https://api.open-meteo.com/v1/forecast?latitude={stadium['lat']}&longitude={stadium['lon']}&daily=temperature_2m_max,precipitation_probability_max,windspeed_10m_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&start_date={date_str}&end_date={date_str}"
@@ -242,18 +247,7 @@ def logit(p):
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-def get_last_nfl_date(sched_df=None):
-    """
-    Finds the most recent game date from the schedule if available.
-    Fallback to weekday logic if schedule missing.
-    """
-    if sched_df is not None and not sched_df.empty and 'gameday' in sched_df.columns:
-        # Assuming schedule has scores for completed games
-        if 'home_score' in sched_df.columns:
-            completed = sched_df.dropna(subset=['home_score'])
-            if not completed.empty:
-                return pd.to_datetime(completed['gameday']).max().date()
-
+def get_last_nfl_date():
     today = datetime.date.today()
     offset = 0
     while True:
@@ -264,7 +258,12 @@ def get_last_nfl_date(sched_df=None):
     return today
 
 def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
+    """
+    Calculates specific Home Field Advantage per team using Log-Odds ratio.
+    Returns a dictionary mapping Team -> HFA Probability Bonus (e.g. 0.03)
+    """
     df = games.copy()
+    # Ensure numeric
     df = df.dropna(subset=['home_score', 'away_score'])
     df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
     
@@ -285,14 +284,21 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
         w_home = g_home["home_win"].sum()
         w_away = (1 - g_away["home_win"]).sum()
 
+        # Smoothed proportions
         p_home = (w_home + smooth) / (n_home + 2 * smooth)
         p_away = (w_away + smooth) / (n_away + 2 * smooth)
 
+        # Log-odds
         l_home = np.log(p_home / (1.0 - p_home))
         l_away = np.log(p_away / (1.0 - p_away))
         delta = l_home - l_away
 
-        z = delta / np.sqrt(1.0/(n_home*p_home*(1-p_home)) + 1.0/(n_away*p_away*(1-p_away)))
+        # SE
+        se_home = np.sqrt(1.0 / (n_home * p_home * (1.0 - p_home)))
+        se_away = np.sqrt(1.0 / (n_away * p_away * (1.0 - p_away)))
+        se_delta = np.sqrt(se_home**2 + se_away**2)
+
+        z = delta / se_delta
         p_val = 2.0 * (1.0 - norm_cdf(abs(z)))
 
         # Relaxed significance: use raw delta if sample is decent
@@ -309,6 +315,8 @@ def load_nfl_data():
     current_year = datetime.date.today().year
     if datetime.date.today().month < 3: current_year -= 1
     
+    last_played_date = get_last_nfl_date()
+    
     # 1. SCHEDULE (Force 2025)
     sched = pd.DataFrame()
     try: sched = nfl.import_schedules([current_year])
@@ -321,8 +329,6 @@ def load_nfl_data():
             sched['gameday'] = pd.to_datetime(sched['gameday']) + pd.DateOffset(years=1)
             sched['gameday'] = sched['gameday'].dt.strftime('%Y-%m-%d')
         except: pass
-        
-    last_played_date = get_last_nfl_date(sched)
 
     # 2. HFA DATA (Last 3 Years - Dedicated)
     hfa_dict = {}
@@ -332,7 +338,7 @@ def load_nfl_data():
         hfa_dict = compute_team_home_advantage(sched_hfa)
     except: pass
 
-    # 3. STATS - ROBUST MIX
+    # 3. STATS - ROBUST MIX - DECOUPLED
     pbp_all = []
     weekly_all = []
     loaded_years = []
@@ -351,33 +357,40 @@ def load_nfl_data():
     except Exception as e:
         status_report[hist_year] = f"❌ Failed ({str(e)})"
 
-    # Load Current Season (2025) - Try Harder with Fallback
+    # Load Current Season (2025) - DECOUPLED PBP AND WEEKLY
+    pbp_curr = pd.DataFrame()
+    weekly_curr = pd.DataFrame()
+    
+    # 3A. Load 2025 PBP (Critical)
     try:
-        p = nfl.import_pbp_data([current_year], cache=False)
-        w = nfl.import_weekly_data([current_year])
-        if not p.empty:
-            pbp_all.append(p)
-            weekly_all.append(w)
-            loaded_years.append(current_year)
-            status_report[current_year] = "✅ Loaded"
-        else:
-            raise ValueError("Empty Lib")
+        pbp_curr = nfl.import_pbp_data([current_year], cache=False)
     except:
         try:
-            # Fallback Weekly Stats
-            url = f"https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{current_year}.csv.gz"
-            w_direct = pd.read_csv(url, compression='gzip', low_memory=False)
-            if not w_direct.empty:
-                weekly_all.append(w_direct)
-                # Also try PBP direct
-                url_pbp = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{current_year}.csv.gz"
-                p_direct = pd.read_csv(url_pbp, compression='gzip', low_memory=False)
-                if not p_direct.empty:
-                    pbp_all.append(p_direct)
-                    loaded_years.append(current_year)
-                    status_report[current_year] = "✅ Loaded (Direct)"
-        except:
-            status_report[current_year] = "❌ Unavailable"
+             url = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{current_year}.csv.gz"
+             pbp_curr = pd.read_csv(url, compression='gzip', low_memory=False)
+        except: pass
+    
+    if not pbp_curr.empty:
+        pbp_all.append(pbp_curr)
+        loaded_years.append(current_year)
+        status_report[f"{current_year} (PBP)"] = "✅ Loaded"
+    else:
+        status_report[f"{current_year} (PBP)"] = "❌ Failed"
+
+    # 3B. Load 2025 Weekly (Secondary)
+    try:
+        weekly_curr = nfl.import_weekly_data([current_year])
+    except:
+        try:
+             url = f"https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{current_year}.csv.gz"
+             weekly_curr = pd.read_csv(url, compression='gzip', low_memory=False)
+        except: pass
+    
+    if not weekly_curr.empty:
+        weekly_all.append(weekly_curr)
+        status_report[f"{current_year} (Players)"] = "✅ Loaded"
+    else:
+        status_report[f"{current_year} (Players)"] = "❌ Failed"
 
     pbp = pd.concat(pbp_all) if pbp_all else pd.DataFrame()
     weekly = pd.concat(weekly_all) if weekly_all else pd.DataFrame()
@@ -388,6 +401,7 @@ def load_nfl_data():
     loaded_year = current_year
     
     if not pbp.empty:
+        # Feature Engineering
         pass_plays = pbp[pbp["play_type"] == "pass"]
         run_plays = pbp[pbp["play_type"] == "run"]
         
@@ -430,7 +444,7 @@ def load_nfl_data():
         if not games_train.empty:
             games_train['gameday_dt'] = pd.to_datetime(games_train['gameday'])
             games_train = games_train[games_train['gameday_dt'].dt.date <= last_played_date]
-        
+
         if not games_train.empty:
             games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
             games_train = games_train.merge(team_stats.add_prefix("home_"), left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
@@ -465,8 +479,8 @@ live_odds_map = OddsService.fetch_live_odds()
 loading_placeholder.empty()
 
 st.sidebar.markdown("### 💾 Data Diagnostics")
-for year, status in status_report.items():
-    st.sidebar.caption(f"**{year}:** {status}")
+for item, status in status_report.items():
+    st.sidebar.caption(f"**{item}:** {status}")
 
 if hfa_db: status_slot.caption("HFA Data: 3 Years Loaded")
 
@@ -508,10 +522,8 @@ class CockpitEngine:
         a_lead = CockpitEngine.get_team_leaders(away)
         props = []
         
-        # 1. Moneyline Props
-        # Using 1.0/p for fair odds in PropLeg is safer for correlations
-        props.append(parlay.PropLeg(f"{home}_ML", f"{home} To Win", 1.0 / max(h_win_prob, 0.01), h_win_prob, "Team Win", home, "Moneyline"))
-        props.append(parlay.PropLeg(f"{away}_ML", f"{away} To Win", 1.0 / max(a_win_prob, 0.01), a_win_prob, "Team Win", away, "Moneyline"))
+        props.append(parlay.PropLeg(f"{home}_ML", f"{home} To Win", 1.0 + (1/h_win_prob), h_win_prob, "Team Win", home, "Moneyline"))
+        props.append(parlay.PropLeg(f"{away}_ML", f"{away} To Win", 1.0 + (1/a_win_prob), a_win_prob, "Team Win", away, "Moneyline"))
 
         def add(p_data, cat, team, m=1.0):
             if not p_data: return
@@ -588,6 +600,7 @@ class CockpitEngine:
         a_rush = s_to_epa(sliders['pa_pwr'])
         a_def_val = s_to_epa(sliders['pa_def'])
 
+        # Corrected Logic: Subtracting Defense value because higher slider = better defense = lower EPA allowed
         adj_net_pass = (h_pass - a_pass) + (h_def_val - a_def_val)
         adj_net_rush = (h_rush - a_rush) + (h_def_val - a_def_val)
         
@@ -793,8 +806,6 @@ def render_strategy_lab(bankroll):
                 st.rerun()
     with c_ticket:
         st.markdown("### 🎫 Ticket")
-        # Select 4 legs specifically if desired by prompt "target 4-leg builds"
-        # but UI logic allows 3-5. We just calc what we have.
         if current_legs:
             res = parlay.ParlayMath.calculate_ticket(current_legs, bankroll)
             for i, leg in enumerate(current_legs): st.write(f"{i+1}. {leg.description}")
@@ -805,10 +816,6 @@ def render_strategy_lab(bankroll):
                 st.success(f"**EV: +{res.ev:.1%}**")
                 st.markdown(f"### Bet: ${res.kelly_stake:.0f}")
             else: st.warning(f"EV: {res.ev:.1%}")
-            
-            # Explicit Max Legs Selection (Prompt asked for explicit targeting)
-            st.caption("Optimized for 3-5 Legs")
-            
         else: st.info("Empty")
 
 if st.session_state.get('sl_active', False):
