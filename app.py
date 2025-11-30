@@ -262,10 +262,6 @@ def get_last_nfl_date_from_sched(sched_df):
     return datetime.date.today()
 
 def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
-    """
-    Calculates specific Home Field Advantage per team using Log-Odds ratio.
-    Returns a dictionary mapping Team -> HFA Probability Bonus (e.g. 0.03)
-    """
     df = games.copy()
     # Ensure numeric
     df = df.dropna(subset=['home_score', 'away_score'])
@@ -305,88 +301,84 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
     return hfa_map
 
 # ==========================================
-# 5. DATA LOADER (ROBUST MIX)
+# 5. DATA LOADER (MIXED: 2023-2024-2025)
 # ==========================================
-def try_load_nflverse_csv(url, label, status_report, yr):
-    try:
-        df = pd.read_csv(url, compression='gzip', low_memory=False)
-        if df.empty:
-            status_report[yr] = f"❌ {label}: Empty"
-            return pd.DataFrame()
-        status_report[yr] = f"✅ {label}: Loaded (Direct CSV)"
-        return df
-    except Exception as e:
-        status_report[yr] = f"❌ {label}: Unavailable"
-        return pd.DataFrame()
-
 @st.cache_resource(ttl=3600)
 def load_nfl_data():
     current_year = datetime.date.today().year
     if datetime.date.today().month < 3: current_year -= 1
     
-    target_season = current_year
+    # 1. SCHEDULE (Force 2025)
+    sched = pd.DataFrame()
+    try: sched = nfl.import_schedules([current_year])
+    except: pass
 
-    # 1. SCHEDULE (Required)
-    try:
-        sched = nfl.import_schedules([target_season])
-        if 'gameday' in sched.columns:
-             sched['gameday'] = pd.to_datetime(sched['gameday']).dt.date
-    except Exception as e:
-        st.error(f"Unable to load schedule for {target_season}: {e}")
-        st.stop()
-
-    if sched is None or sched.empty:
-        st.error(f"No schedule found for {target_season}.")
-        st.stop()
+    if sched.empty:
+        try:
+            sched = nfl.import_schedules([current_year - 1])
+            sched['season'] = current_year
+            sched['gameday'] = pd.to_datetime(sched['gameday']) + pd.DateOffset(years=1)
+            sched['gameday'] = sched['gameday'].dt.strftime('%Y-%m-%d')
+        except: pass
         
     last_played_date = get_last_nfl_date_from_sched(sched)
 
     # 2. HFA DATA
     hfa_dict = {}
     try:
-        hfa_years = [target_season - 3, target_season - 2, target_season - 1]
+        hfa_years = [current_year - 3, current_year - 2, current_year - 1]
         sched_hfa = nfl.import_schedules(hfa_years)
         hfa_dict = compute_team_home_advantage(sched_hfa)
     except: pass
 
-    # 3. STATS - ROBUST LOOP
+    # 3. STATS - ROBUST MIX
     pbp_all = []
     weekly_all = []
     loaded_years = []
     status_report = {}
-    
-    for yr in [target_season - 1, target_season]:
-        # Try Library First
-        try:
-            p = nfl.import_pbp_data([yr], cache=False)
-            w = nfl.import_weekly_data([yr])
-            
-            if not p.empty:
-                pbp_all.append(p)
-                weekly_all.append(w)
-                loaded_years.append(yr)
-                status_report[yr] = "✅ Loaded (Library)"
-            else:
-                # If library returns empty, try direct fallback
-                raise ValueError("Library Empty")
-        except:
-            # Direct CSV Fallback
-            try:
-                url_w = f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{yr}.csv.gz"
-                w_direct = pd.read_csv(url_w, compression='gzip', low_memory=False)
-                
-                url_p = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{yr}.csv.gz"
-                p_direct = pd.read_csv(url_p, compression='gzip', low_memory=False)
 
-                if not p_direct.empty:
-                    pbp_all.append(p_direct)
-                    weekly_all.append(w_direct)
-                    loaded_years.append(yr)
-                    status_report[yr] = "✅ Loaded (Direct CSV)"
-                else:
-                    status_report[yr] = "❌ Unavailable"
-            except Exception as e2:
-                status_report[yr] = f"❌ Failed"
+    # Load Historical Base (2024)
+    try:
+        hist_year = current_year - 1
+        p = nfl.import_pbp_data([hist_year], cache=False)
+        w = nfl.import_weekly_data([hist_year])
+        if not p.empty:
+            pbp_all.append(p)
+            weekly_all.append(w)
+            loaded_years.append(hist_year)
+            status_report[hist_year] = "✅ Loaded (Library)"
+    except Exception as e:
+        status_report[hist_year] = f"❌ Failed ({str(e)})"
+
+    # Load Current Season (2025) - Try Harder with Fallback
+    try:
+        p = nfl.import_pbp_data([current_year], cache=False)
+        w = nfl.import_weekly_data([current_year])
+        if not p.empty:
+            pbp_all.append(p)
+            weekly_all.append(w)
+            loaded_years.append(current_year)
+            status_report[current_year] = "✅ Loaded (Library)"
+        else:
+            raise ValueError("Empty Library Result")
+    except Exception as lib_err:
+        # Library failed, try direct
+        try:
+            url_w = f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{current_year}.csv.gz"
+            w_direct = pd.read_csv(url_w, compression='gzip', low_memory=False)
+            
+            url_p = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{current_year}.csv.gz"
+            p_direct = pd.read_csv(url_p, compression='gzip', low_memory=False)
+
+            if not p_direct.empty:
+                pbp_all.append(p_direct)
+                weekly_all.append(w_direct)
+                loaded_years.append(current_year)
+                status_report[current_year] = "✅ Loaded (Direct CSV)"
+            else:
+                 status_report[current_year] = f"❌ Empty ({lib_err})"
+        except Exception as direct_err:
+            status_report[current_year] = f"❌ Failed: {direct_err}"
 
     pbp = pd.concat(pbp_all, ignore_index=True) if pbp_all else pd.DataFrame()
     weekly = pd.concat(weekly_all, ignore_index=True) if weekly_all else pd.DataFrame()
@@ -394,7 +386,7 @@ def load_nfl_data():
     clf = None
     team_stats = pd.DataFrame()
     qb_stats = pd.DataFrame()
-    loaded_year = target_season
+    loaded_year = current_year
     
     if not pbp.empty:
         # Feature Engineering
@@ -435,14 +427,11 @@ def load_nfl_data():
             dropbacks=('play_id', 'count')
         ).reset_index().sort_values('dropbacks', ascending=False).drop_duplicates(['season', 'posteam'])
 
-        # Training: Use weighted samples
+        # Training
         games_train = sched.dropna(subset=['home_score', 'home_moneyline']).copy()
         if not games_train.empty:
             games_train['gameday_dt'] = pd.to_datetime(games_train['gameday']).dt.date
             games_train = games_train[games_train['gameday_dt'] <= last_played_date]
-        
-        # Apply weights to games (Current season = 3x)
-        games_train['weight'] = games_train['season'].map(lambda s: 3.0 if s == current_year else (1.0 if s == current_year - 1 else 0.5))
 
         if not games_train.empty:
             games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
@@ -462,6 +451,7 @@ def load_nfl_data():
             if not train_clean.empty:
                 clf = LogisticRegression()
                 # Weighted Training
+                train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                 clf.fit(train_clean[features], train_clean['home_win'], sample_weight=train_clean['weight'])
         
         loaded_year = pbp['season'].max()
@@ -499,12 +489,6 @@ class CockpitEngine:
     @staticmethod
     def get_team_leaders(team_abbr):
         if weekly_stats_db.empty: return {}
-        
-        # Safety: Ensure required columns exist in weekly stats
-        req_cols = {'recent_team', 'passing_yards', 'rushing_yards', 'receiving_yards', 'player_display_name', 'week'}
-        if not req_cols.issubset(set(weekly_stats_db.columns)):
-             return {}
-
         recent = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr].sort_values('week', ascending=False).head(50)
         if recent.empty: return {}
         leaders = {}
@@ -868,7 +852,6 @@ def render_strategy_lab(bankroll):
                 st.success(f"**EV: +{res.ev:.1%}**")
                 st.markdown(f"### Bet: ${res.kelly_stake:.0f}")
             else: st.warning(f"EV: {res.ev:.1%}")
-            st.caption(f"Targeting {MAX_LEGS}-Leg SGP")
         else: st.info("Empty")
 
 if st.session_state.get('sl_active', False):
