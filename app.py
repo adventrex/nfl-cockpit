@@ -371,16 +371,22 @@ def load_nfl_data():
                 raise ValueError("Library Empty")
         except:
             # Direct CSV Fallback
-            url_p = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{yr}.csv.gz"
-            url_w = f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{yr}.csv.gz"
-            
-            p_direct = try_load_nflverse_csv(url_p, "PBP", status_report, yr)
-            w_direct = try_load_nflverse_csv(url_w, "Weekly", status_report, yr)
-            
-            if not p_direct.empty:
-                pbp_all.append(p_direct)
-                weekly_all.append(w_direct)
-                loaded_years.append(yr)
+            try:
+                url_w = f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{yr}.csv.gz"
+                w_direct = pd.read_csv(url_w, compression='gzip', low_memory=False)
+                
+                url_p = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{yr}.csv.gz"
+                p_direct = pd.read_csv(url_p, compression='gzip', low_memory=False)
+
+                if not p_direct.empty:
+                    pbp_all.append(p_direct)
+                    weekly_all.append(w_direct)
+                    loaded_years.append(yr)
+                    status_report[yr] = "✅ Loaded (Direct CSV)"
+                else:
+                    status_report[yr] = "❌ Unavailable"
+            except Exception as e2:
+                status_report[yr] = f"❌ Failed"
 
     pbp = pd.concat(pbp_all, ignore_index=True) if pbp_all else pd.DataFrame()
     weekly = pd.concat(weekly_all, ignore_index=True) if weekly_all else pd.DataFrame()
@@ -429,11 +435,14 @@ def load_nfl_data():
             dropbacks=('play_id', 'count')
         ).reset_index().sort_values('dropbacks', ascending=False).drop_duplicates(['season', 'posteam'])
 
-        # Training
+        # Training: Use weighted samples
         games_train = sched.dropna(subset=['home_score', 'home_moneyline']).copy()
         if not games_train.empty:
             games_train['gameday_dt'] = pd.to_datetime(games_train['gameday']).dt.date
             games_train = games_train[games_train['gameday_dt'] <= last_played_date]
+        
+        # Apply weights to games (Current season = 3x)
+        games_train['weight'] = games_train['season'].map(lambda s: 3.0 if s == current_year else (1.0 if s == current_year - 1 else 0.5))
 
         if not games_train.empty:
             games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
@@ -452,7 +461,8 @@ def load_nfl_data():
             train_clean = games_train.dropna(subset=['home_win'] + features)
             if not train_clean.empty:
                 clf = LogisticRegression()
-                clf.fit(train_clean[features], train_clean['home_win'])
+                # Weighted Training
+                clf.fit(train_clean[features], train_clean['home_win'], sample_weight=train_clean['weight'])
         
         loaded_year = pbp['season'].max()
 
@@ -749,8 +759,11 @@ def render_game_card(i, row, bankroll, kelly):
             # Bet Logic with CI Filter
             if z_score >= 1.28 and ev > 0:
                 stake = half_kelly(final_p, dh_live) * bankroll * kelly
-                max_wager_val = bankroll * 0.05 
+                # Clamp to global max wager from sidebar (calculated but not passed, let's recalc here or just use logic)
+                # Sidebar calc was display only, let's enforce it
+                max_wager_val = bankroll * 0.05 # 5% cap
                 stake = min(stake, max_wager_val)
+                
                 st.success(f"BET {home} ${stake:.0f}")
             elif ((1-final_p)*da_live - 1) > 0 and (-(edge) / se_p) >= 1.28:
                  # Inverse for Away
