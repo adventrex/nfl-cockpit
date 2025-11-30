@@ -80,9 +80,6 @@ with st.sidebar:
     
     st.divider()
     status_slot = st.empty()
-    
-    # Placeholder for Years Loaded
-    years_slot = st.empty()
 
 # Date Picker
 c_date, c_status = st.columns([1, 3])
@@ -105,7 +102,6 @@ except ImportError as e:
 # 3. SECONDARY DATA SOURCES
 # ==========================================
 class OddsService:
-    # Map API Team Names to nflverse Abbreviations
     TEAM_MAP = {
         "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
         "Carolina Panthers": "CAR", "Chicago Bears": "CHI", "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
@@ -153,7 +149,6 @@ class OddsService:
         except: return {}
 
 class StadiumService:
-    # Map Team to (Lat, Lon, Type). Type: 'open', 'dome', 'retractable'
     STADIUMS = {
         "ARI": {"lat": 33.5276, "lon": -112.2626, "type": "retractable"},
         "ATL": {"lat": 33.7554, "lon": -84.4010, "type": "retractable"},
@@ -192,19 +187,13 @@ class StadiumService:
     @staticmethod
     @st.cache_data(ttl=3600)
     def get_forecast(team_abbr, date_obj):
-        """Fetches weather from Open-Meteo API"""
         stadium = StadiumService.STADIUMS.get(team_abbr)
         if not stadium: return None
-
-        # If Dome/Retractable, assume closed/good conditions
         if stadium['type'] in ['dome', 'retractable']:
             return {"desc": "🏟️ Stadium Closed/Dome", "is_closed": True, "temp": 72, "wind": 0, "rain": 0}
-
-        # If Open, fetch API
         try:
             date_str = date_obj.strftime("%Y-%m-%d")
             url = f"https://api.open-meteo.com/v1/forecast?latitude={stadium['lat']}&longitude={stadium['lon']}&daily=temperature_2m_max,precipitation_probability_max,windspeed_10m_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&start_date={date_str}&end_date={date_str}"
-            
             res = requests.get(url, timeout=5)
             if res.ok:
                 data = res.json()
@@ -212,12 +201,9 @@ class StadiumService:
                     temp = data['daily']['temperature_2m_max'][0]
                     rain = data['daily']['precipitation_probability_max'][0]
                     wind = data['daily']['windspeed_10m_max'][0]
-                    
                     desc = f"🌡️ {temp}°F  💨 {wind} mph  💧 {rain}% Rain"
                     return {"desc": desc, "is_closed": False, "temp": temp, "wind": wind, "rain": rain}
-        except:
-            pass
-            
+        except: pass
         return {"desc": "Weather Unavailable", "is_closed": False, "temp": 70, "wind": 5, "rain": 0}
 
 # ==========================================
@@ -250,25 +236,30 @@ def logit(p):
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
+def get_last_nfl_date():
+    today = datetime.date.today()
+    offset = 0
+    while True:
+        d = today - datetime.timedelta(days=offset)
+        if d.weekday() in [0, 3, 6]: return d
+        offset += 1
+        if offset > 7: break 
+    return today
+
 def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
     df = games.copy()
     df = df.dropna(subset=['home_score', 'away_score'])
     df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
-    
     teams = pd.unique(pd.concat([df["home_team"], df["away_team"]]))
     hfa_map = {}
-
     for team in teams:
         g_home = df[df["home_team"] == team]
         g_away = df[df["away_team"] == team]
-
         n_home = len(g_home)
         n_away = len(g_away)
-
         if n_home < min_games or n_away < min_games:
             hfa_map[team] = 0.0
             continue
-
         w_home = g_home["home_win"].sum()
         w_away = (1 - g_away["home_win"]).sum()
         p_home = (w_home + smooth) / (n_home + 2 * smooth)
@@ -276,101 +267,105 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
         l_home = np.log(p_home / (1.0 - p_home))
         l_away = np.log(p_away / (1.0 - p_away))
         delta = l_home - l_away
-        
-        # Shrinkage for small samples
+        # Shrinkage
         n_total = n_home + n_away
         shrink = min(1.0, n_total / (2.0 * min_games))
-
         home_prob_equal = 1.0 / (1.0 + np.exp(-delta / 2.0))
         raw_hfa = home_prob_equal - 0.5
         hfa_map[team] = raw_hfa * shrink
-            
     return hfa_map
 
 # ==========================================
-# 5. DATA LOADER (ROBUST MIX)
+# 5. DATA LOADER (ISOLATED & ROBUST)
 # ==========================================
 @st.cache_resource(ttl=3600)
 def load_nfl_data():
     current_year = datetime.date.today().year
     if datetime.date.today().month < 3: current_year -= 1
     
-    target_season = current_year
-
-    # 1. SCHEDULE (Must load current season)
-    try:
-        sched = nfl.import_schedules([target_season])
-    except Exception as e:
-        st.error(f"Unable to load NFL schedule for {target_season}: {e}")
-        st.stop()
-
-    if sched is None or sched.empty:
-        st.error(f"No schedule data returned for season {target_season}.")
-        st.stop()
+    last_played_date = get_last_nfl_date()
     
-    if 'gameday' in sched.columns:
-        sched['gameday'] = pd.to_datetime(sched['gameday']).dt.date
-    else:
-        st.error("Schedule missing 'gameday'.")
-        st.stop()
-        
-    completed = sched.dropna(subset=['home_score'])
-    if not completed.empty:
-        last_played_date = max(completed['gameday'])
-    else:
-        last_played_date = datetime.date.today()
+    # 1. SCHEDULE
+    sched = pd.DataFrame()
+    try: sched = nfl.import_schedules([current_year])
+    except: pass
 
-    # 2. HFA DATA (3 years)
+    if sched.empty:
+        try:
+            sched = nfl.import_schedules([current_year - 1])
+            sched['season'] = current_year
+            sched['gameday'] = pd.to_datetime(sched['gameday']) + pd.DateOffset(years=1)
+            sched['gameday'] = sched['gameday'].dt.strftime('%Y-%m-%d')
+        except: pass
+
+    # 2. HFA
     hfa_dict = {}
     try:
-        hfa_years = [target_season - 3, target_season - 2, target_season - 1]
+        hfa_years = [current_year - 3, current_year - 2, current_year - 1]
         sched_hfa = nfl.import_schedules(hfa_years)
         hfa_dict = compute_team_home_advantage(sched_hfa)
     except: pass
 
-    # 3. STATS - ROBUST MIX (2024 + 2025)
+    # 3. STATS - GRANULAR LOADING (ISOLATED)
     pbp_all = []
     weekly_all = []
     loaded_years = []
     status_report = {}
-    
-    for yr in [target_season - 1, target_season]:
+
+    # 3A. Load 2024
+    try:
+        hist_year = current_year - 1
+        p = nfl.import_pbp_data([hist_year], cache=False)
+        w = nfl.import_weekly_data([hist_year])
+        if not p.empty:
+            pbp_all.append(p)
+            weekly_all.append(w)
+            loaded_years.append(hist_year)
+            status_report[hist_year] = "✅ Loaded (Library)"
+    except Exception as e:
+        status_report[hist_year] = f"❌ Failed ({str(e)})"
+
+    # 3B. Load 2025 (Force Attempt)
+    try:
+        # Try Library first
+        p_curr = nfl.import_pbp_data([current_year], cache=False)
+        w_curr = nfl.import_weekly_data([current_year])
+        if not p_curr.empty:
+            pbp_all.append(p_curr)
+            weekly_all.append(w_curr)
+            loaded_years.append(current_year)
+            status_report[current_year] = "✅ Loaded (Library)"
+        else:
+            raise ValueError("Empty library result")
+    except:
+        # FAILED LIBRARY -> TRY DIRECT URL
         try:
-            p = nfl.import_pbp_data([yr], cache=False)
-            w = nfl.import_weekly_data([yr])
-            if not p.empty:
-                pbp_all.append(p)
-                weekly_all.append(w)
-                loaded_years.append(yr)
-                status_report[yr] = "✅ Loaded (Library)"
+            # 2025 PBP Direct
+            url_p = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{current_year}.csv.gz"
+            p_direct = pd.read_csv(url_p, compression='gzip', low_memory=False)
+            
+            # 2025 Weekly Direct
+            url_w = f"https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{current_year}.csv.gz" # Corrected endpoint name
+            w_direct = pd.read_csv(url_w, compression='gzip', low_memory=False)
+
+            if not p_direct.empty:
+                pbp_all.append(p_direct)
+                if not w_direct.empty: weekly_all.append(w_direct)
+                loaded_years.append(current_year)
+                status_report[current_year] = "✅ Loaded (Direct CSV)"
             else:
-                raise ValueError("Library empty")
+                status_report[current_year] = "⚠️ File Missing (Season not started?)"
         except Exception as e:
-            # Direct CSV Fallback
-            try:
-                url_w = f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{yr}.csv.gz"
-                w_direct = pd.read_csv(url_w, compression='gzip', low_memory=False)
-                
-                url_p = f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{yr}.csv.gz"
-                p_direct = pd.read_csv(url_p, compression='gzip', low_memory=False)
+             status_report[current_year] = f"❌ Failed"
 
-                if not p_direct.empty:
-                    pbp_all.append(p_direct)
-                    weekly_all.append(w_direct)
-                    loaded_years.append(yr)
-                    status_report[yr] = "✅ Loaded (Direct CSV)"
-                else:
-                    status_report[yr] = "❌ Unavailable"
-            except Exception as e2:
-                status_report[yr] = f"❌ Failed: {e2}"
-
-    pbp = pd.concat(pbp_all, ignore_index=True) if pbp_all else pd.DataFrame()
-    weekly = pd.concat(weekly_all, ignore_index=True) if weekly_all else pd.DataFrame()
+    # MERGE whatever we found
+    pbp = pd.concat(pbp_all) if pbp_all else pd.DataFrame()
+    weekly = pd.concat(weekly_all) if weekly_all else pd.DataFrame()
 
     clf = None
     team_stats = pd.DataFrame()
     qb_stats = pd.DataFrame()
-    loaded_year = target_season
+    loaded_year = current_year
     
     if not pbp.empty:
         # Feature Engineering
@@ -413,12 +408,9 @@ def load_nfl_data():
 
         # Training
         games_train = sched.dropna(subset=['home_score', 'home_moneyline']).copy()
-        
-        # Strictly filter to completed games based on Last Played Date
         if not games_train.empty:
-             # Ensure gameday is date object
-            games_train['gameday_dt'] = pd.to_datetime(games_train['gameday']).dt.date
-            games_train = games_train[games_train['gameday_dt'] <= last_played_date]
+            games_train['gameday_dt'] = pd.to_datetime(games_train['gameday'])
+            games_train = games_train[games_train['gameday_dt'].dt.date <= last_played_date]
 
         if not games_train.empty:
             games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
@@ -437,9 +429,7 @@ def load_nfl_data():
             train_clean = games_train.dropna(subset=['home_win'] + features)
             if not train_clean.empty:
                 clf = LogisticRegression()
-                # Weight current season 3x
-                train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == target_season else 1.0)
-                clf.fit(train_clean[features], train_clean['home_win'], sample_weight=train_clean['weight'])
+                clf.fit(train_clean[features], train_clean['home_win'])
         
         loaded_year = pbp['season'].max()
 
@@ -455,13 +445,14 @@ live_odds_map = OddsService.fetch_live_odds()
 
 loading_placeholder.empty()
 
-st.sidebar.markdown("### 💾 Data Diagnostics")
+st.sidebar.markdown("### 💾 Data Health")
 for item, status in status_report.items():
-    st.sidebar.caption(f"**{item}:** {status}")
+    color = "green" if "Loaded" in status else "red"
+    st.sidebar.markdown(f"- **{item}:** :{color}[{status}]")
 
 if loaded_years_list:
     years_str = ", ".join(str(y) for y in sorted(list(set(loaded_years_list))))
-    years_slot.caption(f"Stats Loaded: {years_str}")
+    # years_slot.caption(f"Active Stats: {years_str}")
 
 if hfa_db: status_slot.caption("HFA Data: 3 Years Loaded")
 
@@ -707,7 +698,7 @@ def render_game_card(i, row, bankroll, kelly):
             
             p_be = 1 / dh_live
             edge = final_p - p_be
-            se_p = 0.04 # Conservative SE
+            se_p = 0.04 
             z_score = edge / se_p
             
             ev = final_p * dh_live - 1
@@ -722,17 +713,12 @@ def render_game_card(i, row, bankroll, kelly):
                     val_fmt = f"{v:.1%}" if k == "AI Model (Stats)" else f"{v:+.1%}"
                     st.write(f"- {k}: {val_fmt}")
             
-            # Bet Logic with CI Filter
             if z_score >= 1.28 and ev > 0:
                 stake = half_kelly(final_p, dh_live) * bankroll * kelly
-                # Clamp to global max wager from sidebar (calculated but not passed, let's recalc here or just use logic)
-                # Sidebar calc was display only, let's enforce it
-                max_wager_val = bankroll * 0.05 # 5% cap
+                max_wager_val = bankroll * 0.05 
                 stake = min(stake, max_wager_val)
-                
                 st.success(f"BET {home} ${stake:.0f}")
             elif ((1-final_p)*da_live - 1) > 0 and (-(edge) / se_p) >= 1.28:
-                 # Inverse for Away
                  stake = half_kelly(1-final_p, da_live) * bankroll * kelly
                  max_wager_val = bankroll * 0.05
                  stake = min(stake, max_wager_val)
