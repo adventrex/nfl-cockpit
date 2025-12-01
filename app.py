@@ -295,9 +295,6 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
         l_away = np.log(p_away / (1.0 - p_away))
         delta = l_home - l_away
 
-        z = delta / np.sqrt(1.0/(n_home*p_home*(1-p_home)) + 1.0/(n_away*p_away*(1-p_away)))
-        p_val = 2.0 * (1.0 - norm_cdf(abs(z)))
-
         # Relaxed significance: use raw delta if sample is decent
         home_prob_equal = 1.0 / (1.0 + np.exp(-delta / 2.0))
         raw_hfa = home_prob_equal - 0.5
@@ -470,7 +467,7 @@ def load_nfl_data():
             train_clean = games_train.dropna(subset=['home_win'] + features)
             if not train_clean.empty:
                 clf = LogisticRegression()
-                # Weighted Training
+                # Weighted Training: 3x weight for current season
                 train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                 clf.fit(train_clean[features], train_clean['home_win'], sample_weight=train_clean['weight'])
         
@@ -509,17 +506,19 @@ class CockpitEngine:
     @staticmethod
     def get_team_leaders(team_abbr):
         if weekly_stats_db.empty: return {}
-        # Guard against schema changes
+        
+        # Safety: Ensure required columns exist in weekly stats
         req_cols = {'recent_team', 'passing_yards', 'rushing_yards', 'receiving_yards', 'player_display_name', 'week'}
         if not req_cols.issubset(set(weekly_stats_db.columns)):
              return {}
 
-        recent = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr].sort_values('week', ascending=False).head(50)
-        if recent.empty: return {}
-        
+        # 1. Filter for this team
+        team_rows = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr]
+        if team_rows.empty: return {}
+
         # 2. Find the MAX season and MAX week (The "Now")
-        max_season = recent['season'].max()
-        current_season_rows = recent[recent['season'] == max_season]
+        max_season = team_rows['season'].max()
+        current_season_rows = team_rows[team_rows['season'] == max_season]
         max_week = current_season_rows['week'].max()
         
         # 3. Get only players from that specific last game
@@ -563,3 +562,366 @@ class CockpitEngine:
         props.append(parlay.PropLeg(f"{away}_ML", f"{away} To Win", 1.0 / max(a_win_prob, 0.01), a_win_prob, "Team Win", away, "Moneyline"))
 
         def add(p_data, cat, team, m=1.0):
+            if not p_data: return
+            line = round(p_data['raw_yds'] * m / 5) * 5 + 0.5
+            desc = f"{p_data['name']} Over {line} {cat} Yds"
+            props.append(parlay.PropLeg(desc, desc, 1.91, 0.50, cat, team, p_data['stat']))
+
+        if 'QB' in h_lead: add(h_lead['QB'], "Passing", home, 0.95)
+        if 'RB' in h_lead: add(h_lead['RB'], "Rushing", home, 0.85)
+        if 'WR' in h_lead: add(h_lead['WR'], "Receiving", home, 0.90)
+        if 'QB' in a_lead: add(a_lead['QB'], "Passing", away, 0.95)
+        if 'RB' in a_lead: add(a_lead['RB'], "Rushing", away, 0.85)
+        if 'WR' in a_lead: add(a_lead['WR'], "Receiving", away, 0.90)
+        return props
+
+    @staticmethod
+    def get_default_sliders(row, weather_data):
+        s_def = {'h_qb': 5, 'h_pwr': 5, 'h_def': 5, 'a_qb': 5, 'a_pwr': 5, 'a_def': 5, 'rest': 5, 'news': 5, 'weath': 0, 'hfa': 5}
+        if not team_stats_db.empty:
+            h_team, a_team = row['home_team'], row['away_team']
+            h = team_stats_db[(team_stats_db['team']==h_team)].sort_values('season', ascending=False).head(1)
+            a = team_stats_db[(team_stats_db['team']==a_team)].sort_values('season', ascending=False).head(1)
+            def epa_to_10(epa, reverse=False):
+                val = 5 + (epa / 0.04)
+                if reverse: val = 5 - (epa / 0.04) 
+                return int(min(max(val, 0), 10))
+            if not h.empty:
+                s_def['h_qb'] = epa_to_10(h['epa_pass_off'].values[0])
+                s_def['h_pwr'] = epa_to_10(h['epa_rush_off'].values[0])
+                avg_def_epa = (h['epa_pass_def'].values[0] + h['epa_rush_def'].values[0]) / 2
+                s_def['h_def'] = epa_to_10(avg_def_epa, reverse=True)
+            if not a.empty:
+                s_def['a_qb'] = epa_to_10(a['epa_pass_off'].values[0])
+                s_def['a_pwr'] = epa_to_10(a['epa_rush_off'].values[0])
+                avg_def_epa = (a['epa_pass_def'].values[0] + a['epa_rush_def'].values[0]) / 2
+                s_def['a_def'] = epa_to_10(avg_def_epa, reverse=True)
+        
+        hfa_val = hfa_db.get(row['home_team'], 0.0)
+        hfa_ticks = hfa_val / 0.015
+        s_def['hfa'] = int(min(max(5 + hfa_ticks, 0), 10))
+
+        rest_h = row.get('home_rest', 7)
+        rest_a = row.get('away_rest', 7)
+        if abs(rest_h - rest_a) > 3: 
+             s_def['rest'] = 8 if rest_h > rest_a else 2
+        
+        if weather_data and not weather_data['is_closed']:
+            if weather_data['wind'] > 15 or weather_data['rain'] > 50: s_def['weath'] = 6
+        return s_def
+        
+    @staticmethod
+    def get_simple_gold_prediction(home_team, away_team, season):
+        if team_stats_db.empty: return None
+        h = team_stats_db[(team_stats_db['team'] == home_team)].sort_values('season', ascending=False).head(1)
+        a = team_stats_db[(team_stats_db['team'] == away_team)].sort_values('season', ascending=False).head(1)
+        if h.empty or a.empty: return None
+        def expected(val_off, val_def): return (val_off + val_def) / 2
+        h_pass = expected(h['avg_pass_off'].values[0], a['avg_pass_def'].values[0])
+        h_rush = expected(h['avg_rush_off'].values[0], a['avg_rush_def'].values[0])
+        h_to   = expected(h['avg_tos_off'].values[0], a['avg_tos_def'].values[0])
+        a_pass = expected(a['avg_pass_off'].values[0], h['avg_pass_def'].values[0])
+        a_rush = expected(a['avg_rush_off'].values[0], h['avg_rush_def'].values[0])
+        a_to   = expected(a['avg_tos_off'].values[0], h['avg_tos_def'].values[0])
+        h_score = 2.0 + (h_pass * 0.04) + (h_rush * 0.04) - (h_to * 4.0) + 2.0
+        a_score = 2.0 + (a_pass * 0.04) + (a_rush * 0.04) - (a_to * 4.0)
+        return {'h_score': h_score, 'a_score': a_score, 'h_pass': h_pass, 'h_rush': h_rush, 'h_to': h_to, 'a_pass': a_pass, 'a_rush': a_rush, 'a_to': a_to}
+
+    @staticmethod
+    def calc_win_prob(market_prob, row, sliders):
+        logit_mkt = logit(market_prob)
+        def s_to_epa(val): return (val - 5) * 0.03 
+        h_pass = s_to_epa(sliders['ph_qb'])
+        h_rush = s_to_epa(sliders['ph_pwr'])
+        h_def_val = s_to_epa(sliders['ph_def'])
+        a_pass = s_to_epa(sliders['pa_qb'])
+        a_rush = s_to_epa(sliders['pa_pwr'])
+        a_def_val = s_to_epa(sliders['pa_def'])
+
+        adj_net_pass = (h_pass - a_pass) + (h_def_val - a_def_val)
+        adj_net_rush = (h_rush - a_rush) + (h_def_val - a_def_val)
+        
+        base_diff_pass, base_diff_rush = 0.0, 0.0
+        if not team_stats_db.empty:
+            h = team_stats_db[(team_stats_db['team']==row['home_team'])].sort_values('season', ascending=False).head(1)
+            a = team_stats_db[(team_stats_db['team']==row['away_team'])].sort_values('season', ascending=False).head(1)
+            if not h.empty and not a.empty:
+                base_diff_pass = h['epa_net_pass'].values[0] - a['epa_net_pass'].values[0]
+                base_diff_rush = h['epa_net_rush'].values[0] - a['epa_net_rush'].values[0]
+
+        model_p = market_prob
+        if model_clf:
+            x = pd.DataFrame([[logit_mkt, base_diff_pass + adj_net_pass, base_diff_rush + adj_net_rush]], 
+                           columns=['logit_mkt', 'diff_net_pass', 'diff_net_rush'])
+            model_raw = model_clf.predict_proba(x)[0, 1]
+            model_p = (0.7 * market_prob) + (0.3 * model_raw)
+
+        news = (5 - sliders['wn']) * 0.015
+        weather = -0.02 * (sliders['ww'] / 5) if sliders['ww'] > 0 else 0
+        rest = ((sliders.get('rh',7)-sliders.get('ra',7))*0.005) * (sliders['wr']/2.0)
+        hfa_boost = (sliders['hfa'] - 5) * 0.015
+
+        final = min(max(model_p + news + weather + rest + hfa_boost, 0.01), 0.99)
+        return final, {"AI Model (Stats)": model_p, "News Variance": news, "Weather Penalty": weather, "Rest Advantage": rest, "Home Field": hfa_boost}
+
+# ==========================================
+# 8. UI RENDERERS
+# ==========================================
+def render_game_card(i, row, bankroll, kelly):
+    home, away = row['home_team'], row['away_team']
+    season = row['season']
+    
+    def safe_int(val):
+        try: return int(val)
+        except: return -110
+    
+    def_oa = safe_int(row.get('away_moneyline'))
+    def_oh = safe_int(row.get('home_moneyline'))
+    src = "Schedule (Cached)"
+
+    dh_default, da_default = american_to_decimal(def_oh), american_to_decimal(def_oa)
+    hold_default = synthetic_hold(dh_default, da_default)
+    
+    live_odds = live_odds_map.get((home, away))
+    if not live_odds: live_odds = live_odds_map.get((away, home))
+    if live_odds:
+        def_oh, def_oa = live_odds['home_am'], live_odds['away_am']
+        src = "DraftKings (Live)"
+    
+    h_qb = CockpitEngine.get_qb_metrics(home, season)
+    a_qb = CockpitEngine.get_qb_metrics(away, season)
+    weather_info = StadiumService.get_forecast(home, sel_date)
+    defs = CockpitEngine.get_default_sliders(row, weather_info)
+
+    with st.container(border=True):
+        c1, c2 = st.columns([3, 1])
+        c1.subheader(f"{away} @ {home}")
+        c1.caption(f"{row['gametime']} ET")
+        if weather_info: c1.caption(f"{weather_info['desc']}")
+        
+        if hold_default > 0.05:
+            c1.caption(f"⚠️ Rich market (feed hold {hold_default:.1%})")
+
+        with c2:
+            st.markdown("**QB Matchup**")
+            if h_qb is not None and a_qb is not None:
+                edge_txt = "Even"
+                if h_qb['qb_epa'] > a_qb['qb_epa'] + 0.05: edge_txt = f"✅ {h_qb['passer_player_name']}"
+                elif a_qb['qb_epa'] > h_qb['qb_epa'] + 0.05: edge_txt = f"✅ {a_qb['passer_player_name']}"
+                st.caption(f"Edge: {edge_txt}")
+            else: st.caption("Data Unavailable")
+
+        with st.expander("See QB Efficiency Stats (EPA & CPOE)"):
+            c_qa, c_qh = st.columns(2)
+            if a_qb is not None:
+                c_qa.markdown(f"**{a_qb['passer_player_name']}** ({away})")
+                c_qa.metric("EPA/Play", f"{a_qb['qb_epa']:.2f}")
+                c_qa.metric("CPOE", f"{a_qb['qb_cpoe']:.1f}%")
+            if h_qb is not None:
+                c_qh.markdown(f"**{h_qb['passer_player_name']}** ({home})")
+                c_qh.metric("EPA/Play", f"{h_qb['qb_epa']:.2f}")
+                c_qh.metric("CPOE", f"{h_qb['qb_cpoe']:.1f}%")
+
+        st.divider()
+        c_odds, c_away, c_home, c_res = st.columns([1, 1.5, 1.5, 1.2])
+        with c_odds:
+            st.markdown(f"##### 🏦 {src}")
+            oa = st.number_input(f"{away}", value=def_oa, step=5, key=f"oa_{i}")
+            oh = st.number_input(f"{home}", value=def_oh, step=5, key=f"oh_{i}")
+            da_live, dh_live = american_to_decimal(oa), american_to_decimal(oh)
+            pmkt = no_vig_two_way(dh_live, da_live)[0]
+            
+            hold_live = synthetic_hold(dh_live, da_live)
+            
+            # Dynamic Market Prob Display
+            # pmkt[0] is Home. pmkt[1] is Away.
+            # If Home >= 50%, show Home. Else show Away.
+            if pmkt >= 0.5:
+                disp_mkt_prob = pmkt
+                disp_mkt_team = home
+            else:
+                disp_mkt_prob = 1.0 - pmkt
+                disp_mkt_team = away
+                
+            st.progress(disp_mkt_prob, f"Mkt: {disp_mkt_team} {disp_mkt_prob:.1%}")
+            
+            if hold_live > 0.07:
+                st.warning(f"Hold {hold_live:.1%} > 7%. Skipping.")
+                return
+            elif hold_live > 0.05:
+                st.caption(f"Hold: {hold_live:.1%} (High)")
+
+        with c_away:
+            st.markdown(f"##### {away} Adjust")
+            pa_qb = st.slider(f"QB Rating", 0, 10, defs['a_qb'], key=f"pa_qb_{i}", help="0=Bench, 5=Avg, 10=MVP")
+            pa_pwr = st.slider(f"Run/Power", 0, 10, defs['a_pwr'], key=f"pa_pwr_{i}", help="Run Game/O-Line Strength")
+            pa_def = st.slider(f"Defense", 0, 10, defs['a_def'], key=f"pa_def_{i}", help="Ability to stop scores")
+
+        with c_home:
+            st.markdown(f"##### {home} Adjust")
+            ph_qb = st.slider(f"QB Rating", 0, 10, defs['h_qb'], key=f"ph_qb_{i}", help="0=Bench, 5=Avg, 10=MVP")
+            ph_pwr = st.slider(f"Run/Power", 0, 10, defs['h_pwr'], key=f"ph_pwr_{i}", help="Run Game/O-Line Strength")
+            ph_def = st.slider(f"Defense", 0, 10, defs['h_def'], key=f"ph_def_{i}", help="Ability to stop scores")
+            
+        st.markdown("##### Context")
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        wr = st.slider("Rest", 0, 10, defs['rest'], key=f"wr_{i}", help="5=Big Advantage (Bye vs Short Week)")
+        wn = st.slider("News (Home vs Away)", 0, 10, defs['news'], key=f"wn_{i}", help="0=Good for Home, 5=Neutral, 10=Good for Away")
+        hfa = st.slider("Home Field", 0, 10, defs['hfa'], help="Auto-calculated advantage from history", key=f"hfa_{i}")
+        weather_disable = weather_info and weather_info['is_closed']
+        ww = st.slider("Weather", 0, 10, defs['weath'], disabled=weather_disable, key=f"ww_{i}")
+        if weather_disable: cc4.caption("🔒 Indoor Stadium")
+
+        with c_res:
+            sliders = {'pa_qb': pa_qb, 'pa_pwr': pa_pwr, 'pa_def': pa_def, 'ph_qb': ph_qb, 'ph_pwr': ph_pwr, 'ph_def': ph_def, 'wr': wr, 'wn': wn, 'ww': ww, 'hfa': hfa, 'rh': row.get('home_rest',7), 'ra': row.get('away_rest',7)}
+            final_p_home, breakdown = CockpitEngine.calc_win_prob(pmkt, row, sliders)
+            
+            # Determine Verdict Side
+            if final_p_home >= 0.5:
+                pick_team = home
+                pick_prob = final_p_home
+                pick_odds = dh_live
+                mkt_ref = pmkt # Home market prob
+            else:
+                pick_team = away
+                pick_prob = 1.0 - final_p_home
+                pick_odds = da_live
+                mkt_ref = 1.0 - pmkt # Away market prob
+            
+            p_be = 1 / pick_odds
+            edge = pick_prob - p_be
+            se_p = 0.04 
+            z_score = edge / se_p
+            ev = pick_prob * pick_odds - 1
+            
+            st.markdown("##### 🚀 Verdict")
+            st.markdown(f"**Model Pick:** {pick_team}")
+            st.metric("Win Prob", f"{pick_prob:.1%}", delta=f"{pick_prob-mkt_ref:.1%}")
+            
+            with st.expander("🧮 View Math"):
+                st.markdown("**Component Contribution:**")
+                for k, v in breakdown.items():
+                    val_fmt = f"{v:.1%}" if k == "AI Model (Stats)" else f"{v:+.1%}"
+                    st.write(f"- {k}: {val_fmt}")
+            
+            # Bet Logic with CI Filter
+            max_wager_val = bankroll * 0.05
+            
+            if z_score >= 1.28 and ev > 0:
+                stake = half_kelly(pick_prob, pick_odds) * bankroll * kelly
+                stake = min(stake, max_wager_val)
+                st.success(f"BET {pick_team} ${stake:.0f}")
+            else:
+                if ev > 0: st.warning("Edge too small (CI filter)")
+                else: st.info("No Edge")
+
+        with st.expander("🏆 Simple Gold Standard (Outcome Checker)"):
+            gold = CockpitEngine.get_simple_gold_prediction(home, away, season)
+            if gold:
+                c_g1, c_g2 = st.columns(2)
+                with c_g1:
+                    st.markdown(f"**{away} Projected**")
+                    st.write(f"Pass: {gold['a_pass']:.0f} yds")
+                    st.write(f"Rush: {gold['a_rush']:.0f} yds")
+                    st.write(f"Turnovers: {gold['a_to']:.1f}")
+                    st.metric("Score", f"{gold['a_score']:.1f}")
+                with c_g2:
+                    st.markdown(f"**{home} Projected**")
+                    st.write(f"Pass: {gold['h_pass']:.0f} yds")
+                    st.write(f"Rush: {gold['h_rush']:.0f} yds")
+                    st.write(f"Turnovers: {gold['h_to']:.1f}")
+                    st.metric("Score", f"{gold['h_score']:.1f}")
+                diff = gold['h_score'] - gold['a_score']
+                winner = home if diff > 0 else away
+                st.success(f"**Prediction: {winner} wins by {abs(diff):.1f} points**")
+            else: st.caption("Insufficient Data for Gold Standard Model")
+
+        if st.button(f"🧠 Open Strategy Lab: {away} vs {home}", key=f"sl_{i}"):
+            st.session_state['sl_active'] = True
+            st.session_state['sl_home'] = home
+            st.session_state['sl_away'] = away
+            st.session_state['sl_h_prob'] = final_p_home
+            st.session_state['sl_legs'] = []
+            st.rerun()
+
+# ==========================================
+# 9. STRATEGY LAB UI
+# ==========================================
+def render_strategy_lab(bankroll):
+    st.markdown(f"## 🧠 Strategy Lab: {st.session_state['sl_away']} @ {st.session_state['sl_home']}")
+    if st.button("← Back to Schedule"):
+        st.session_state['sl_active'] = False
+        st.rerun()
+    home = st.session_state['sl_home']
+    away = st.session_state['sl_away']
+    h_prob = st.session_state['sl_h_prob']
+    
+    a_prob = 1.0 - h_prob
+    
+    if 'sl_pool' not in st.session_state or not st.session_state['sl_legs']:
+        st.session_state['sl_pool'] = CockpitEngine.generate_props(home, away, h_prob, a_prob)
+    all_props = st.session_state['sl_pool']
+    current_legs = st.session_state['sl_legs']
+    MAX_LEGS = 4
+    st.divider()
+    c_build, c_ticket = st.columns([2, 1])
+    with c_build:
+        if len(current_legs) == 0:
+            st.subheader("Step 1: Pick the Winner")
+            c1, c2 = st.columns(2)
+            h_ml = next((p for p in all_props if p.description == f"{home} To Win"), None)
+            a_ml = next((p for p in all_props if p.description == f"{away} To Win"), None)
+            if h_ml and c1.button(f"🏆 {home}"):
+                st.session_state['sl_legs'].append(h_ml)
+                st.rerun()
+            if a_ml and c2.button(f"🏆 {away}"):
+                st.session_state['sl_legs'].append(a_ml)
+                st.rerun()
+        elif len(current_legs) < MAX_LEGS:
+            last_leg = current_legs[-1]
+            st.subheader(f"Next Step: What correlates with {last_leg.description}?")
+            fits = parlay.ParlayMath.find_best_additions(current_legs, all_props, top_n=3)
+            if fits:
+                cols = st.columns(3)
+                for idx, leg in enumerate(fits):
+                    with cols[idx]:
+                        with st.container(border=True):
+                            st.markdown(f"**{leg.description}**")
+                            st.caption(f"Type: {leg.category}")
+                            st.markdown(f"*:gray[{leg.recent_stat}]*") 
+                            if st.button("➕ Add", key=f"add_{leg.leg_id}_{len(current_legs)}"):
+                                st.session_state['sl_legs'].append(leg)
+                                st.rerun()
+            else: st.info("No more high-correlation props found.")
+        else: st.success(f"Ticket Full ({MAX_LEGS} Legs).")
+            
+        if len(current_legs) > 0:
+            if st.button("🔄 Reset Ticket"):
+                st.session_state['sl_legs'] = []
+                st.rerun()
+    with c_ticket:
+        st.markdown("### 🎫 Ticket")
+        if current_legs:
+            res = parlay.ParlayMath.calculate_ticket(current_legs, bankroll)
+            for i, leg in enumerate(current_legs): st.write(f"{i+1}. {leg.description}")
+            st.divider()
+            st.metric("Odds", f"{res.final_odds:.2f}")
+            st.metric("Win Prob", f"{res.win_prob:.1%}")
+            if res.ev > 0:
+                st.success(f"**EV: +{res.ev:.1%}**")
+                st.markdown(f"### Bet: ${res.kelly_stake:.0f}")
+            else: st.warning(f"EV: {res.ev:.1%}")
+            st.caption(f"Targeting {MAX_LEGS}-Leg SGP")
+        else: st.info("Empty")
+
+if st.session_state.get('sl_active', False):
+    render_strategy_lab(bankroll)
+else:
+    if not sched_db.empty:
+        sched_db['gameday'] = sched_db['gameday'].astype(str)
+        day_games = sched_db[sched_db['gameday'] == str(sel_date)]
+        if day_games.empty:
+            st.warning(f"No games found for {sel_date}.")
+        else:
+            st.markdown(f"### 🔥 {len(day_games)} Games Found")
+            for i, row in day_games.iterrows(): render_game_card(i, row, bankroll, kelly)
