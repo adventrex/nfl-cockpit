@@ -1,0 +1,55 @@
+import pandas as pd
+import requests
+import io
+
+def fetch_2025_stats():
+    print("🏈 Connecting to nflverse raw data repository...")
+    
+    # 1. URL for the aggregated player stats (updated weekly)
+    # This is the standard file used by nflreadr and nfl_data_py
+    url = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv.gz"
+    
+    try:
+        print(f"⬇️ Downloading raw data (this may take a moment)...")
+        # Read directly into pandas (handles gzip automatically)
+        df = pd.read_csv(url, compression='gzip', low_memory=False)
+        
+        # 2. Filter for 2025 Season
+        print("🔍 Filtering for 2025 Season...")
+        df_2025 = df[df['season'] == 2025].copy()
+        
+        if df_2025.empty:
+            print("⚠️ Warning: 2025 data not found (season might not have started).")
+            print("   Falling back to 2024 for demonstration purposes.")
+            df_2025 = df[df['season'] == 2024].copy()
+        
+        # 3. Select "Prop-Relevant" Columns
+        # We drop complex advanced stats to keep the CSV clean for Streamlit
+        cols_to_keep = [
+            'player_display_name', 'position', 'recent_team', 'week', 'season',
+            'completions', 'attempts', 'passing_yards', 'passing_tds', 'interceptions',
+            'carries', 'rushing_yards', 'rushing_tds',
+            'receptions', 'targets', 'receiving_yards', 'receiving_tds',
+            'fantasy_points_ppr'
+        ]
+        
+        # Keep only columns that exist
+        existing_cols = [c for c in cols_to_keep if c in df_2025.columns]
+        clean_df = df_2025[existing_cols]
+        
+        # 4. Fill NaNs with 0 for stat columns
+        stat_cols = [c for c in existing_cols if c not in ['player_display_name', 'position', 'recent_team']]
+        clean_df[stat_cols] = clean_df[stat_cols].fillna(0)
+        
+        # 5. Save
+        output_file = 'nfl_stats_2025.csv'
+        clean_df.to_csv(output_file, index=False)
+        
+        print(f"✅ Success! Saved {len(clean_df)} rows to '{output_file}'")
+        print(f"   (Unique Players: {clean_df['player_display_name'].nunique()})")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+if __name__ == "__main__":
+    fetch_2025_stats()
