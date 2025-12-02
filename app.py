@@ -295,6 +295,9 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
         l_away = np.log(p_away / (1.0 - p_away))
         delta = l_home - l_away
 
+        z = delta / np.sqrt(1.0/(n_home*p_home*(1-p_home)) + 1.0/(n_away*p_away*(1-p_away)))
+        p_val = 2.0 * (1.0 - norm_cdf(abs(z)))
+
         # Relaxed significance: use raw delta if sample is decent
         home_prob_equal = 1.0 / (1.0 + np.exp(-delta / 2.0))
         raw_hfa = home_prob_equal - 0.5
@@ -467,7 +470,7 @@ def load_nfl_data():
             train_clean = games_train.dropna(subset=['home_win'] + features)
             if not train_clean.empty:
                 clf = LogisticRegression()
-                # Weighted Training: 3x weight for current season
+                # WEIGHTED TRAINING: Give 2025 games 3x more weight
                 train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                 clf.fit(train_clean[features], train_clean['home_win'], sample_weight=train_clean['weight'])
         
@@ -525,24 +528,23 @@ class CockpitEngine:
         last_game_stats = current_season_rows[current_season_rows['week'] == max_week]
         
         if last_game_stats.empty: return {}
-
-        leaders = {}
         
-        # QB: Sort by passing yards
-        qb = last_game_stats.sort_values('passing_yards', ascending=False).head(1)
-        if not qb.empty:
+        leaders = {}
+        # QB: Sort by attempts (not just yards) to get the starter
+        if 'attempts' in last_game_stats.columns:
+            qb = last_game_stats.sort_values('attempts', ascending=False).head(1)
+        else:
+            qb = last_game_stats.sort_values('passing_yards', ascending=False).head(1)
+            
+        if not qb.empty and qb.iloc[0]['passing_yards'] > 0: # Ensure they actually played
             leaders['QB'] = {'name': qb.iloc[0]['player_display_name'], 'raw_yds': qb.iloc[0]['passing_yards'], 'stat': f"Last: {qb.iloc[0]['passing_yards']} yds"}
             
-        # RB: Sort by rushing yards
         rb = last_game_stats.sort_values('rushing_yards', ascending=False).head(1)
         if not rb.empty:
             leaders['RB'] = {'name': rb.iloc[0]['player_display_name'], 'raw_yds': rb.iloc[0]['rushing_yards'], 'stat': f"Last: {rb.iloc[0]['rushing_yards']} yds"}
-            
-        # WR: Sort by receiving yards
-        wr = last_game_stats.sort_values('receiving_yards', ascending=False).head(1)
+        wr = last_game.sort_values('receiving_yards', ascending=False).head(1)
         if not wr.empty:
             leaders['WR'] = {'name': wr.iloc[0]['player_display_name'], 'raw_yds': wr.iloc[0]['receiving_yards'], 'stat': f"Last: {wr.iloc[0]['receiving_yards']} yds"}
-            
         return leaders
 
     @staticmethod
@@ -565,6 +567,7 @@ class CockpitEngine:
             if not p_data: return
             line = round(p_data['raw_yds'] * m / 5) * 5 + 0.5
             desc = f"{p_data['name']} Over {line} {cat} Yds"
+            # Placeholder prob
             props.append(parlay.PropLeg(desc, desc, 1.91, 0.50, cat, team, p_data['stat']))
 
         if 'QB' in h_lead: add(h_lead['QB'], "Passing", home, 0.95)
@@ -580,8 +583,10 @@ class CockpitEngine:
         s_def = {'h_qb': 5, 'h_pwr': 5, 'h_def': 5, 'a_qb': 5, 'a_pwr': 5, 'a_def': 5, 'rest': 5, 'news': 5, 'weath': 0, 'hfa': 5}
         if not team_stats_db.empty:
             h_team, a_team = row['home_team'], row['away_team']
+            # Use LATEST available season for stats
             h = team_stats_db[(team_stats_db['team']==h_team)].sort_values('season', ascending=False).head(1)
             a = team_stats_db[(team_stats_db['team']==a_team)].sort_values('season', ascending=False).head(1)
+            
             def epa_to_10(epa, reverse=False):
                 val = 5 + (epa / 0.04)
                 if reverse: val = 5 - (epa / 0.04) 
@@ -598,7 +603,8 @@ class CockpitEngine:
                 s_def['a_def'] = epa_to_10(avg_def_epa, reverse=True)
         
         hfa_val = hfa_db.get(row['home_team'], 0.0)
-        hfa_ticks = hfa_val / 0.015
+        # Scale: 0.0 is 5. Max delta/2 ~0.5 -> HFA 0.10 -> Slider 10
+        hfa_ticks = hfa_val / 0.02
         s_def['hfa'] = int(min(max(5 + hfa_ticks, 0), 10))
 
         rest_h = row.get('home_rest', 7)
@@ -671,15 +677,7 @@ def render_game_card(i, row, bankroll, kelly):
     home, away = row['home_team'], row['away_team']
     season = row['season']
     
-    def safe_int(val):
-        try: return int(val)
-        except: return -110
-    
-    def_oa = safe_int(row.get('away_moneyline'))
-    def_oh = safe_int(row.get('home_moneyline'))
-    src = "Schedule (Cached)"
-
-    dh_default, da_default = american_to_decimal(def_oh), american_to_decimal(def_oa)
+    dh_default, da_default = american_to_decimal(int(row['home_moneyline'])), american_to_decimal(int(row['away_moneyline']))
     hold_default = synthetic_hold(dh_default, da_default)
     
     live_odds = live_odds_map.get((home, away))
@@ -687,7 +685,11 @@ def render_game_card(i, row, bankroll, kelly):
     if live_odds:
         def_oh, def_oa = live_odds['home_am'], live_odds['away_am']
         src = "DraftKings (Live)"
-    
+    else:
+        def_oa = int(row['away_moneyline']) if pd.notnull(row.get('away_moneyline')) else -110
+        def_oh = int(row['home_moneyline']) if pd.notnull(row.get('home_moneyline')) else -110
+        src = "Schedule (Cached)"
+
     h_qb = CockpitEngine.get_qb_metrics(home, season)
     a_qb = CockpitEngine.get_qb_metrics(away, season)
     weather_info = StadiumService.get_forecast(home, sel_date)
@@ -732,18 +734,7 @@ def render_game_card(i, row, bankroll, kelly):
             pmkt = no_vig_two_way(dh_live, da_live)[0]
             
             hold_live = synthetic_hold(dh_live, da_live)
-            
-            # Dynamic Market Prob Display
-            # pmkt[0] is Home. pmkt[1] is Away.
-            # If Home >= 50%, show Home. Else show Away.
-            if pmkt >= 0.5:
-                disp_mkt_prob = pmkt
-                disp_mkt_team = home
-            else:
-                disp_mkt_prob = 1.0 - pmkt
-                disp_mkt_team = away
-                
-            st.progress(disp_mkt_prob, f"Mkt: {disp_mkt_team} {disp_mkt_prob:.1%}")
+            st.progress(pmkt, f"Imp: {pmkt:.1%}")
             
             if hold_live > 0.07:
                 st.warning(f"Hold {hold_live:.1%} > 7%. Skipping.")
