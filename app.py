@@ -252,14 +252,39 @@ class StadiumService:
         return {"desc": "Weather Unavailable", "is_closed": False, "temp": 70, "wind": 5, "rain": 0}
 
 # ==========================================
-# 5. MATH HELPERS
+# 5. MATH HELPERS (SAFE VERSION)
 # ==========================================
-def american_to_decimal(odds): return (1 + odds/100) if odds > 0 else (1 + 100/abs(odds))
-def no_vig_two_way(d1, d2): return p1/(p1+p2), p2/(p1+p2) if (p1:=1/d1) and (p2:=1/d2) else (0,0)
-def synthetic_hold(d1, d2): return (1/d1 + 1/d2) - 1
-def half_kelly(p, d, cap=0.05): return max(0, min(((d-1)*p - (1-p))/(d-1) * 0.5, cap))
-def logit(p): return math.log(max(p, 1e-6) / (1 - max(p, 1e-6)))
-def norm_cdf(x): return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+def american_to_decimal(odds):
+    try: odds = float(odds)
+    except: return 2.0
+    if odds == 0: return 2.0
+    if odds > 0: return 1 + (odds / 100) 
+    else: return 1 + (100 / abs(odds))
+
+def no_vig_two_way(d1, d2):
+    if d1 <= 0 or d2 <= 0: return (0.5, 0.5)
+    p1 = 1/d1
+    p2 = 1/d2
+    s = p1 + p2
+    return (p1/s, p2/s)
+
+def synthetic_hold(d1, d2):
+    if d1 <= 0 or d2 <= 0: return 0.0
+    return (1/d1 + 1/d2) - 1
+
+def half_kelly(p, d, cap=0.05):
+    if d <= 1: return 0
+    b = d - 1
+    q = 1 - p
+    f_full = (b * p - q) / b
+    f_half = f_full * 0.5
+    return max(0, min(f_half, cap))
+
+def logit(p):
+    return math.log(max(p, 1e-6) / (1 - max(p, 1e-6)))
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def get_last_nfl_date_from_sched(sched_df):
     if sched_df is None or sched_df.empty or 'gameday' not in sched_df.columns: return datetime.date.today()
@@ -277,8 +302,9 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
         g_home, g_away = df[df["home_team"] == team], df[df["away_team"] == team]
         if len(g_home) < min_games or len(g_away) < min_games: hfa_map[team] = 0.0; continue
         p_home = (g_home["home_win"].sum() + smooth) / (len(g_home) + 2 * smooth)
-        p_away = ((len(g_away) - g_away["home_win"].sum()) + smooth) / (len(g_away) + 2 * smooth)
-        delta = np.log(p_home / (1.0 - p_home)) - np.log(p_away / (1.0 - p_away))
+        wins_away = len(g_a) - g_a["home_win"].sum() if not g_away.empty else 0
+        p_away = (wins_away + smooth) / (len(g_away) + 2 * smooth)
+        delta = np.log(p_home/(1-p_home)) - np.log(p_away/(1-p_away))
         shrink = min(1.0, (len(g_home)+len(g_away)) / (2.0 * min_games))
         hfa_map[team] = (1.0 / (1.0 + np.exp(-delta / 2.0)) - 0.5) * shrink
     return hfa_map
@@ -286,11 +312,17 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
 # ==========================================
 # 6. DATA LOADER
 # ==========================================
-def try_load_nflverse_csv(url):
+def try_load_nflverse_csv(url, label, status_report, yr):
     try:
         df = pd.read_csv(url, compression='gzip', low_memory=False)
-        return df if not df.empty else None
-    except: return None
+        if df.empty:
+            status_report[yr] = f"❌ {label}: Empty"
+            return pd.DataFrame()
+        status_report[yr] = f"✅ {label}: Loaded (Direct CSV)"
+        return df
+    except Exception as e:
+        # status_report[yr] = f"❌ {label}: Unavailable"
+        return pd.DataFrame()
 
 @st.cache_resource(ttl=3600)
 def load_nfl_data():
@@ -330,9 +362,9 @@ def load_nfl_data():
             w = nfl.import_weekly_data([yr])
             status[yr] = "✅ Lib"
         except:
-            p = try_load_nflverse_csv(f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{yr}.csv.gz")
-            w = try_load_nflverse_csv(f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{yr}.csv.gz")
-            status[yr] = "✅ CSV" if p is not None else "❌ Fail"
+            p = try_load_nflverse_csv(f"https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{yr}.csv.gz", "PBP", status, yr)
+            w = try_load_nflverse_csv(f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{yr}.csv.gz", "Weekly", status, yr)
+            if yr not in status: status[yr] = "✅ CSV" if p is not None else "❌ Fail"
             
         if p is not None: pbp_all.append(p); loaded_years.append(yr)
         if w is not None: weekly_all.append(w)
@@ -370,7 +402,6 @@ def load_nfl_data():
         team_stats['avg_pass_def'] = team_stats['pass_yds_def'] / team_stats['games']
         team_stats['avg_rush_def'] = team_stats['rush_yds_def'] / team_stats['games']
         team_stats['avg_tos_def'] = (team_stats['def_int'] + team_stats['def_fumbles']) / team_stats['games']
-        
         team_stats['epa_net_pass'] = team_stats['epa_pass_off'] - team_stats['epa_pass_def']
         team_stats['epa_net_rush'] = team_stats['epa_rush_off'] - team_stats['epa_rush_def']
         
@@ -385,15 +416,8 @@ def load_nfl_data():
             if not games_train.empty:
                 games_train = games_train[games_train['gameday'] <= last_played_date]
                 games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
-                
-                # FIX: Add prefixes before merge to avoid column name collisions
-                home_stats = team_stats.add_prefix("home_")
-                away_stats = team_stats.add_prefix("away_")
-                
-                # Correct merge calls with renamed columns
-                games_train = games_train.merge(home_stats, left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
-                games_train = games_train.merge(away_stats, left_on=["season", "away_team"], right_on=["away_season", "away_team"], how="left")
-                
+                games_train = games_train.merge(team_stats.add_prefix("home_"), left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
+                games_train = games_train.merge(team_stats.add_prefix("away_"), left_on=["season", "away_team"], right_on=["away_season", "away_team"], how="left")
                 games_train["diff_net_pass"] = games_train["home_epa_net_pass"] - games_train["away_epa_net_pass"]
                 games_train["diff_net_rush"] = games_train["home_epa_net_rush"] - games_train["away_epa_net_rush"]
                 
