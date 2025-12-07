@@ -370,6 +370,7 @@ def load_nfl_data():
         team_stats['avg_pass_def'] = team_stats['pass_yds_def'] / team_stats['games']
         team_stats['avg_rush_def'] = team_stats['rush_yds_def'] / team_stats['games']
         team_stats['avg_tos_def'] = (team_stats['def_int'] + team_stats['def_fumbles']) / team_stats['games']
+        
         team_stats['epa_net_pass'] = team_stats['epa_pass_off'] - team_stats['epa_pass_def']
         team_stats['epa_net_rush'] = team_stats['epa_rush_off'] - team_stats['epa_rush_def']
         
@@ -384,8 +385,15 @@ def load_nfl_data():
             if not games_train.empty:
                 games_train = games_train[games_train['gameday'] <= last_played_date]
                 games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
-                games_train = games_train.merge(team_stats.add_prefix("home_"), left_on=["season", "home_team"], right_on=["season", "team"], how="left")
-                games_train = games_train.merge(team_stats.add_prefix("away_"), left_on=["season", "away_team"], right_on=["season", "team"], how="left")
+                
+                # FIX: Add prefixes before merge to avoid column name collisions
+                home_stats = team_stats.add_prefix("home_")
+                away_stats = team_stats.add_prefix("away_")
+                
+                # Correct merge calls with renamed columns
+                games_train = games_train.merge(home_stats, left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
+                games_train = games_train.merge(away_stats, left_on=["season", "away_team"], right_on=["away_season", "away_team"], how="left")
+                
                 games_train["diff_net_pass"] = games_train["home_epa_net_pass"] - games_train["away_epa_net_pass"]
                 games_train["diff_net_rush"] = games_train["home_epa_net_rush"] - games_train["away_epa_net_rush"]
                 
@@ -400,6 +408,8 @@ def load_nfl_data():
                     # WEIGHT: 3x for current season
                     train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                     clf.fit(train_clean[['logit_mkt', 'diff_net_pass', 'diff_net_rush']], train_clean['home_win'], sample_weight=train_clean['weight'])
+        
+        loaded_year = pbp['season'].max()
 
     return clf, team_stats, weekly, sched, qb_stats, hfa_dict, status, loaded_years, analysis_db
 
