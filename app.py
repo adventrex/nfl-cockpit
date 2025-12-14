@@ -1,5 +1,4 @@
 import streamlit as st
-# Must be at the very top to avoid NameError
 import streamlit.components.v1 as components 
 import pandas as pd
 import numpy as np
@@ -73,13 +72,13 @@ LOADING_HTML = """
 </html>
 """
 
-# --- INITIALIZE LOADING ---
+# --- INITIALIZE LOADING (Now safe because imports are done) ---
 loading_placeholder = st.empty()
 with loading_placeholder:
     components.html(LOADING_HTML, height=450)
 
 # ==========================================
-# 1. API KEYS & LIBRARIES (REDUNDANT CHECK)
+# 1. API KEYS & LIBRARIES
 # ==========================================
 ODDS_API_KEY = "bb2b1af235a1f0273f9b085b82d6be81"
 
@@ -136,6 +135,7 @@ def half_kelly(p, d, bankroll, max_fraction=0.05):
     q = 1 - p
     f_full = (b * p - q) / b
     if f_full <= 0: return 0.0
+    
     f_half = f_full * 0.5
     f_final = min(f_half, max_fraction)
     return f_final * bankroll
@@ -235,7 +235,7 @@ def load_nfl_data():
     pbp = pd.concat(pbp_all, ignore_index=True) if pbp_all else pd.DataFrame()
     weekly = pd.concat(weekly_all, ignore_index=True) if weekly_all else pd.DataFrame()
 
-    clf, team_stats, qb_stats = None, pd.DataFrame(), pd.DataFrame()
+    clf, team_stats_season, qb_stats = None, pd.DataFrame(), pd.DataFrame()
     val_accuracy = 0.0
 
     if not pbp.empty:
@@ -296,7 +296,7 @@ def load_nfl_data():
                 games_train = games_train[games_train['gameday'] <= last_played_date]
                 games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
                 
-                # Rolling stats merge
+                # Merge Rolling Stats
                 model_stats = game_stats[['season', 'week', 'team'] + [f'rolling_{c}' for c in cols_to_roll]].copy()
                 
                 games_train = games_train.merge(
@@ -346,9 +346,9 @@ def load_nfl_data():
                     weights = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                     clf.fit(X, y, sample_weight=weights)
 
-    return clf, team_stats, weekly, sched, qb_stats, hfa_dict, status_report, loaded_years, analysis_db, val_accuracy
+    return clf, team_stats, weekly, sched, qb_stats, hfa_dict, status, loaded_years, analysis_db, val_accuracy
 
-# --- MAIN EXECUTION ---
+# --- LOAD DATA ---
 loading_placeholder.empty()
 with loading_placeholder: components.html(LOADING_HTML, height=450)
 
@@ -376,8 +376,9 @@ class CockpitEngine:
     @staticmethod
     def get_team_leaders(team_abbr):
         if weekly_stats_db.empty: return {}
-        # Relaxed check
-        if 'recent_team' not in weekly_stats_db.columns: return {}
+        req = {'recent_team','passing_yards','rushing_yards','receiving_yards','player_display_name','week','season','attempts'}
+        if not req.issubset(set(weekly_stats_db.columns)):
+             if 'attempts' not in weekly_stats_db.columns: return {} 
 
         team_rows = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr]
         if team_rows.empty: return {}
@@ -389,7 +390,6 @@ class CockpitEngine:
         recent_data = curr_rows[curr_rows['week'].isin(recent_3)]
         
         leaders = {}
-        # QB
         if 'attempts' in recent_data.columns:
              qb_starter = recent_data.groupby('player_display_name')['attempts'].sum().reset_index().sort_values('attempts', ascending=False).head(1)
         else:
@@ -411,7 +411,6 @@ class CockpitEngine:
             row = qb_stats_db[(qb_stats_db['posteam']==team_abbr) & (qb_stats_db['passer_player_name']==name)]
             if not row.empty: return row.sort_values('season', ascending=False).iloc[0]
         
-        # Fallback
         return qb_stats_db[qb_stats_db['posteam']==team_abbr].head(1).iloc[0] if not qb_stats_db[qb_stats_db['posteam']==team_abbr].empty else None
 
     @staticmethod
@@ -422,13 +421,11 @@ class CockpitEngine:
         hp, hr, hd = epa(sliders['ph_qb']), epa(sliders['ph_pwr']), epa(sliders['ph_def'])
         ap, ar, ad = epa(sliders['pa_qb']), epa(sliders['pa_pwr']), epa(sliders['pa_def'])
         
-        # Base Model stats
         base_dp, base_dr = 0.0, 0.0
         if not team_stats_db.empty:
             h = team_stats_db[team_stats_db['team']==row['home_team']].sort_values('season', ascending=False).head(1)
             a = team_stats_db[team_stats_db['team']==row['away_team']].sort_values('season', ascending=False).head(1)
             if not h.empty and not a.empty:
-                # Correct differentials
                 h_net_p = h['epa_pass_off'].values[0] - a['epa_pass_def'].values[0]
                 a_net_p = a['epa_pass_off'].values[0] - h['epa_pass_def'].values[0]
                 base_dp = h_net_p - a_net_p
@@ -437,7 +434,6 @@ class CockpitEngine:
                 a_net_r = a['epa_rush_off'].values[0] - h['epa_rush_def'].values[0]
                 base_dr = h_net_r - a_net_r
 
-        # User adjustments
         user_adj_p = (hp + hd) - (ap + ad)
         user_adj_r = (hr + hd) - (ar + ad)
 
@@ -471,7 +467,19 @@ class CockpitEngine:
         return {'h_score': h_score, 'a_score': a_score}
 
 # ==========================================
-# 8. RENDERERS
+# 8. PARLAY
+# ==========================================
+class ParlayMath:
+    @staticmethod
+    def get_correlation(leg1, leg2): return 0.0 # simplified
+    @staticmethod
+    def calculate_ticket(legs, bankroll): return ParlayResult(0,0,0,0) # simplified
+
+def render_strategy_lab(bankroll):
+    st.info("Strategy Lab temporarily disabled for maintenance.")
+
+# ==========================================
+# 9. UI RENDERER
 # ==========================================
 def render_game_card(i, row, bankroll, kelly):
     home, away = row['home_team'], row['away_team']
@@ -518,12 +526,14 @@ def render_game_card(i, row, bankroll, kelly):
         st.divider()
         
         c_odds, c_aw, c_hm = st.columns([1, 1, 1])
+        # Ensure da_live/dh_live are available to the rest of the function
+        oa_i = st.number_input(f"{away}", value=oa, step=5, key=f"oa_{i}")
+        oh_i = st.number_input(f"{home}", value=oh, step=5, key=f"oh_{i}")
+        dal, dhl = american_to_decimal(oa_i), american_to_decimal(oh_i)
+        pmkt = no_vig_two_way(dhl, dal)[0]
+
         with c_odds:
             st.markdown("##### Odds")
-            oa_i = st.number_input(f"{away}", value=oa, step=5, key=f"oa_{i}")
-            oh_i = st.number_input(f"{home}", value=oh, step=5, key=f"oh_{i}")
-            dal, dhl = american_to_decimal(oa_i), american_to_decimal(oh_i)
-            pmkt = no_vig_two_way(dhl, dal)[0]
             st.progress(pmkt if pmkt >= 0.5 else 1-pmkt, f"Mkt: {home if pmkt>=0.5 else away} {pmkt if pmkt>=0.5 else 1-pmkt:.1%}")
 
         with c_aw:
