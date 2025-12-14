@@ -12,13 +12,6 @@ from math import erf, sqrt
 from sklearn.linear_model import LogisticRegression
 
 # ==========================================
-# 0. CONSTANTS & CONFIG
-# ==========================================
-EPA_NEUTRAL_SLIDER = 5
-EPA_PER_SLIDER_POINT = 0.03
-SE_PROB = 0.04 # Standard Error for Probability
-
-# ==========================================
 # 1. UI CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="NFL Edge Cockpit Pro", page_icon="🏈", layout="wide")
@@ -54,8 +47,8 @@ LOADING_HTML = """
       <div class="code-col">
         <div class="code-line">IMPORTING nfl_data_py...</div>
         <div class="code-line" style="animation-delay: 0.5s">FETCHING 2024-2025 PBP...</div>
-        <div class="code-line" style="animation-delay: 1.0s">CALCULATING ROLLING EPA...</div>
-        <div class="code-line" style="animation-delay: 1.5s">ELIMINATING DATA LEAKAGE...</div>
+        <div class="code-line" style="animation-delay: 1.0s">CALCULATING EPA/PLAY...</div>
+        <div class="code-line" style="animation-delay: 1.5s">MERGING SCHEDULE DATA...</div>
       </div>
       <div class="code-col">
         <div class="code-line">OPTIMIZING KELLY CRITERION...</div>
@@ -106,6 +99,7 @@ ODDS_API_KEY = "bb2b1af235a1f0273f9b085b82d6be81"
 try:
     import nfl_data_py as nfl
     from sklearn.linear_model import LogisticRegression
+    import parlay_engine as parlay
 except ImportError as e:
     st.error(f"Missing Libraries: {e}. Please run: pip install nfl_data_py scikit-learn pandas numpy requests")
     st.stop()
@@ -404,7 +398,8 @@ def load_nfl_data():
         game_stats = game_stats.merge(pass_stats, on=['game_id', 'posteam', 'season', 'week'], how='left')
         game_stats = game_stats.merge(rush_stats, on=['game_id', 'posteam', 'season', 'week'], how='left')
         
-        # 2. Sort by date
+        # 2. Sort by date and De-Duplicate to ensure unique Game-Team rows
+        game_stats = game_stats.drop_duplicates(subset=['game_id', 'posteam'])
         game_stats = game_stats.sort_values(['posteam', 'game_date'])
         
         # 3. Calculate Rolling Stats (Shift 1 to prevent leakage)
@@ -426,11 +421,8 @@ def load_nfl_data():
         })
         
         # Add defense stats (simplified for UI, model uses rolling)
-        # In a full model, we'd roll defense too, but for UI sliders this is sufficient
-        # We need `avg_pass_off` etc for the UI card
-        team_stats['avg_pass_off'] = team_stats['epa_pass_off'] # Mapping EPA to what UI expects roughly
+        team_stats['avg_pass_off'] = team_stats['epa_pass_off'] 
         team_stats['avg_rush_off'] = team_stats['epa_rush_off']
-        # Mock defense stats for sliders since we didn't fully agg defense pbp
         team_stats['epa_pass_def'] = 0.0 # Placeholder
         team_stats['epa_rush_def'] = 0.0
         team_stats['avg_pass_def'] = 0.0
@@ -451,17 +443,7 @@ def load_nfl_data():
                 games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
                 
                 # Merge Rolling Stats (Home)
-                games_train = games_train.merge(
-                    game_stats[['game_id', 'rolling_pass_epa', 'rolling_rush_epa']].add_prefix('home_'),
-                    left_on='game_id', right_on='home_game_id', how='left' # Note: nfl_data_py schedule doesn't have game_id usually, uses 'game_id' as common key?
-                    # The nfl_data_py sched has 'game_id'. 
-                    # But wait, game_stats has 'game_id' for the game that JUST happened.
-                    # We need the stats ENTERING the game.
-                    # This merge is tricky. We need to merge by Team + Week.
-                )
-                
-                # Re-do Merge strategy: Merge by Team and Week
-                # Rename rolling stats for clarity
+                # Need to merge on (Season, Week, Team)
                 model_stats = game_stats[['season', 'week', 'posteam', 'rolling_pass_epa', 'rolling_rush_epa']].copy()
                 
                 games_train = games_train.merge(
@@ -513,10 +495,11 @@ if sched_db is None or sched_db.empty: st.error("No Schedule."); st.stop()
 class CockpitEngine:
     @staticmethod
     def get_team_leaders(team_abbr):
-        # Implementation of _get_recent_qb_for_team logic basically
         if weekly_stats_db.empty: return {}
-        
-        # Filter for team
+        req = {'recent_team','passing_yards','rushing_yards','receiving_yards','player_display_name','week','season','attempts'}
+        if not req.issubset(set(weekly_stats_db.columns)):
+             if 'attempts' not in weekly_stats_db.columns: return {} # need attempts
+
         team_rows = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr]
         if team_rows.empty: return {}
 
@@ -570,8 +553,8 @@ class CockpitEngine:
         a_lead = CockpitEngine.get_team_leaders(away)
         props = []
         # Moneyline - Correct 7 args
-        props.append(PropLeg(f"{home}_ML", f"{home} To Win", 1.0/max(h_win_prob,0.01), h_win_prob, "Team Win", home, "Moneyline"))
-        props.append(PropLeg(f"{away}_ML", f"{away} To Win", 1.0/max(a_win_prob,0.01), a_win_prob, "Team Win", away, "Moneyline"))
+        props.append(PropLeg(f"{home}_ML", f"{home} To Win", 1.0/max(h_win_prob,0.01), h_win_prob, "Team Win", home, "Moneyline", ""))
+        props.append(PropLeg(f"{away}_ML", f"{away} To Win", 1.0/max(a_win_prob,0.01), a_win_prob, "Team Win", away, "Moneyline", ""))
         
         def add(p, cat, team):
             if not p: return
