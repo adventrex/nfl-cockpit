@@ -99,7 +99,6 @@ ODDS_API_KEY = "bb2b1af235a1f0273f9b085b82d6be81"
 try:
     import nfl_data_py as nfl
     from sklearn.linear_model import LogisticRegression
-    import parlay_engine as parlay
 except ImportError as e:
     st.error(f"Missing Libraries: {e}. Please run: pip install nfl_data_py scikit-learn pandas numpy requests")
     st.stop()
@@ -513,22 +512,23 @@ class CockpitEngine:
         return leaders
 
     @staticmethod
-    def get_qb_metrics(team_abbr, season):
+    def get_qb_metrics(team_abbr, season=None):
+        """Return primary QB for a team based on latest season + most dropbacks."""
         if qb_stats_db.empty: return None
-        # Try finding the 'leader' QB first
-        leaders = CockpitEngine.get_team_leaders(team_abbr)
-        if 'QB' in leaders:
-            name = leaders['QB']['name']
-            row = qb_stats_db[(qb_stats_db['season']==season) & (qb_stats_db['posteam']==team_abbr) & (qb_stats_db['passer_player_name']==name)]
-            if not row.empty: return row.iloc[0]
-            # Try to find recent stats for this QB even if not current season in pbp aggregate
-            row = qb_stats_db[(qb_stats_db['posteam']==team_abbr) & (qb_stats_db['passer_player_name']==name)].sort_values('season', ascending=False)
-            if not row.empty: return row.iloc[0]
 
-        # Fallback
-        starter = qb_stats_db[(qb_stats_db['posteam']==team_abbr) & (qb_stats_db['season']==season)].head(1)
-        if starter.empty: starter = qb_stats_db[qb_stats_db['posteam']==team_abbr].head(1) 
-        return starter.iloc[0] if not starter.empty else None
+        # Filter for team in qb_stats_db
+        team_qbs = qb_stats_db[qb_stats_db["posteam"] == team_abbr]
+        if team_qbs.empty: return None
+
+        # Find latest season available for this team in PBP stats
+        latest_season = team_qbs["season"].max()
+        season_qbs = team_qbs[team_qbs["season"] == latest_season]
+        
+        # Sort by dropbacks to find starter
+        starter = season_qbs.sort_values("dropbacks", ascending=False).head(1)
+        
+        if starter.empty: return None
+        return starter.iloc[0]
 
     @staticmethod
     def generate_props(home, away, h_win_prob, a_win_prob):
@@ -678,8 +678,8 @@ def render_game_card(i, row, bankroll, kelly):
         src = "DraftKings (Live)"
     else: src = "Schedule (Cached)"
 
-    h_qb = CockpitEngine.get_qb_metrics(home, season)
-    a_qb = CockpitEngine.get_qb_metrics(away, season)
+    h_qb = CockpitEngine.get_qb_metrics(home) # Remove season arg
+    a_qb = CockpitEngine.get_qb_metrics(away) # Remove season arg
     weather_info = StadiumService.get_forecast(home, sel_date)
     defs = CockpitEngine.get_default_sliders(row, weather_info)
 
@@ -701,12 +701,8 @@ def render_game_card(i, row, bankroll, kelly):
 
         with c2:
             st.markdown("**QB Matchup**")
-            # Use CockpitEngine.get_team_leaders to display correct starter
-            leaders_h = CockpitEngine.get_team_leaders(home)
-            leaders_a = CockpitEngine.get_team_leaders(away)
-            
-            qb_h_name = leaders_h.get('QB', {}).get('name', 'Unknown')
-            qb_a_name = leaders_a.get('QB', {}).get('name', 'Unknown')
+            qb_h_name = h_qb['passer_player_name'] if h_qb is not None else 'Unknown'
+            qb_a_name = a_qb['passer_player_name'] if a_qb is not None else 'Unknown'
             
             st.caption(f"{qb_a_name} vs {qb_h_name}")
 
@@ -783,10 +779,16 @@ def render_game_card(i, row, bankroll, kelly):
                 for k,v in breakdown.items(): st.write(f"{k}: {v:+.1%}")
             
             max_w = bankroll * 0.05
+            
             if z_score >= 1.28 and ev > 0:
                 stake = half_kelly(pick_prob, pick_odds) * bankroll * kelly
-                stake = min(stake, max_wager_val)
+                stake = min(stake, max_w)
                 st.success(f"BET {pick_team} ${stake:.0f}")
+            elif ((1-final_p_home)*da_live - 1) > 0 and (-(edge) / se_p) >= 1.28:
+                 # Inverse for Away
+                 stake = half_kelly(1-final_p_home, da_live) * bankroll * kelly
+                 stake = min(stake, max_w)
+                 st.success(f"BET {away} ${stake:.0f}")
             else:
                 if ev > 0: st.warning("Weak Edge")
                 else: st.info("No Edge")
