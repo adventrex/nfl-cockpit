@@ -47,8 +47,8 @@ LOADING_HTML = """
       <div class="code-col">
         <div class="code-line">IMPORTING nfl_data_py...</div>
         <div class="code-line" style="animation-delay: 0.5s">FETCHING 2024-2025 PBP...</div>
-        <div class="code-line" style="animation-delay: 1.0s">CALCULATING EPA/PLAY...</div>
-        <div class="code-line" style="animation-delay: 1.5s">MERGING SCHEDULE DATA...</div>
+        <div class="code-line" style="animation-delay: 1.0s">CALCULATING ROLLING EPA...</div>
+        <div class="code-line" style="animation-delay: 1.5s">ELIMINATING DATA LEAKAGE...</div>
       </div>
       <div class="code-col">
         <div class="code-line">OPTIMIZING KELLY CRITERION...</div>
@@ -276,6 +276,7 @@ def synthetic_hold(d1, d2):
     return (1/d1 + 1/d2) - 1
 
 def half_kelly(p, d, cap=0.05):
+    # Fixed logic: Calc Full Kelly, take 50%, then check cap
     if d <= 1: return 0
     b = d - 1
     q = 1 - p
@@ -382,36 +383,45 @@ def load_nfl_data():
     clf, team_stats, qb_stats = None, pd.DataFrame(), pd.DataFrame()
     
     if not pbp.empty:
-        # Feature Eng
-        pass_plays = pbp[pbp["play_type"] == "pass"]
-        run_plays = pbp[pbp["play_type"] == "run"]
+        # Feature Eng: EPA by Team per Game (for rolling stats)
+        # We need "entering" stats, not season aggregate.
+        # Strategy: Group by Team/Game, calc rolling mean, shift 1.
         
-        off_pass = pass_plays.groupby(["season", "posteam"]).agg(epa_pass_off=("epa", "mean"), pass_yds_off=("yards_gained", "sum")).reset_index().rename(columns={"posteam": "team"})
-        off_run = run_plays.groupby(["season", "posteam"]).agg(epa_rush_off=("epa", "mean"), rush_yds_off=("yards_gained", "sum")).reset_index().rename(columns={"posteam": "team"})
-        game_counts = pbp.groupby(['season', 'posteam'])['game_id'].nunique().reset_index().rename(columns={'game_id': 'games', 'posteam': 'team'})
-        tos = pbp.groupby(["season", "posteam"]).agg(interceptions=("interception", "sum"), fumbles_lost=("fumble_lost", "sum")).reset_index().rename(columns={"posteam": "team"})
-
-        pbp["defteam"] = pbp["defteam"].fillna(pbp["posteam"])
-        def_pass = pass_plays.groupby(["season", "defteam"]).agg(epa_pass_def=("epa", "mean"), pass_yds_def=("yards_gained", "sum")).reset_index().rename(columns={"defteam": "team"})
-        def_run = run_plays.groupby(["season", "defteam"]).agg(epa_rush_def=("epa", "mean"), rush_yds_def=("yards_gained", "sum")).reset_index().rename(columns={"defteam": "team"})
-        takeaways = pbp.groupby(["season", "defteam"]).agg(def_int=("interception", "sum"), def_fumbles=("fumble_lost", "sum")).reset_index().rename(columns={"defteam": "team"})
-
-        team_stats = pd.merge(off_pass, off_run, on=["season", "team"], how="outer")
-        team_stats = pd.merge(team_stats, game_counts, on=["season", "team"], how="outer")
-        team_stats = pd.merge(team_stats, tos, on=["season", "team"], how="outer")
-        team_stats = pd.merge(team_stats, def_pass, on=["season", "team"], how="outer")
-        team_stats = pd.merge(team_stats, def_run, on=["season", "team"], how="outer")
-        team_stats = pd.merge(team_stats, takeaways, on=["season", "team"], how="outer")
+        # 1. Aggregate to Team-Game level
+        team_game_off = pbp[pbp.play_type.isin(['pass','run'])].groupby(['season', 'week', 'posteam']).agg(
+            epa_off=('epa', 'mean'),
+            pass_epa=('epa', lambda x: x[pbp['play_type']=='pass'].mean()),
+            rush_epa=('epa', lambda x: x[pbp['play_type']=='run'].mean())
+        ).reset_index().rename(columns={'posteam': 'team'})
         
-        team_stats['avg_pass_off'] = team_stats['pass_yds_off'] / team_stats['games']
-        team_stats['avg_rush_off'] = team_stats['rush_yds_off'] / team_stats['games']
-        team_stats['avg_tos_off'] = (team_stats['interceptions'] + team_stats['fumbles_lost']) / team_stats['games']
-        team_stats['avg_pass_def'] = team_stats['pass_yds_def'] / team_stats['games']
-        team_stats['avg_rush_def'] = team_stats['rush_yds_def'] / team_stats['games']
-        team_stats['avg_tos_def'] = (team_stats['def_int'] + team_stats['def_fumbles']) / team_stats['games']
-        team_stats['epa_net_pass'] = team_stats['epa_pass_off'] - team_stats['epa_pass_def']
-        team_stats['epa_net_rush'] = team_stats['epa_rush_off'] - team_stats['epa_rush_def']
+        team_game_def = pbp[pbp.play_type.isin(['pass','run'])].groupby(['season', 'week', 'defteam']).agg(
+            epa_def=('epa', 'mean'),
+            pass_epa_def=('epa', lambda x: x[pbp['play_type']=='pass'].mean()),
+            rush_epa_def=('epa', lambda x: x[pbp['play_type']=='run'].mean())
+        ).reset_index().rename(columns={'defteam': 'team'})
         
+        team_game = pd.merge(team_game_off, team_game_def, on=['season', 'week', 'team'], how='outer')
+        team_game.sort_values(['team', 'season', 'week'], inplace=True)
+        
+        # 2. Calculate Rolling stats (Shifted by 1 to prevent leakage)
+        # Use Expanding mean to simulate "Season to Date"
+        cols = ['epa_off', 'pass_epa', 'rush_epa', 'epa_def', 'pass_epa_def', 'rush_epa_def']
+        for c in cols:
+            team_game[f'rolling_{c}'] = team_game.groupby('team')[c].transform(lambda x: x.expanding().mean().shift(1))
+        
+        # Also compute a full season avg for display/sliders
+        team_stats = team_game.groupby(['season', 'team'])[cols].mean().reset_index()
+        
+        # Rename for slider/UI compatibility
+        team_stats.rename(columns={
+            'epa_off': 'epa_off', # Used in UI?
+            'pass_epa': 'epa_pass_off',
+            'rush_epa': 'epa_rush_off',
+            'pass_epa_def': 'epa_pass_def',
+            'rush_epa_def': 'epa_rush_def'
+        }, inplace=True)
+        
+        # QB Stats (Keep as is for display)
         if 'cpoe' not in pbp.columns: pbp['cpoe'] = 0.0
         qb_stats = pbp[pbp['play_type']=='pass'].groupby(['season', 'posteam', 'passer_player_name']).agg(
             qb_epa=('epa', 'mean'), qb_cpoe=('cpoe', 'mean'), dropbacks=('play_id', 'count')
@@ -424,19 +434,25 @@ def load_nfl_data():
                 games_train = games_train[games_train['gameday'] <= last_played_date]
                 games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
                 
-                # CORRECTED MERGE LOGIC WITH PREFIXES
-                games_train = games_train.merge(team_stats.add_prefix("home_"), left_on=["season", "home_team"], right_on=["home_season", "home_team"], how="left")
-                games_train = games_train.merge(team_stats.add_prefix("away_"), left_on=["season", "away_team"], right_on=["away_season", "away_team"], how="left")
+                # Merge ROLLING stats (Pre-game state)
+                # Need to merge on (Season, Week, Team)
+                games_train = games_train.merge(team_game, left_on=['season', 'week', 'home_team'], right_on=['season', 'week', 'team'], how='left', suffixes=('', '_home'))
+                games_train = games_train.rename(columns={c: f'home_{c}' for c in team_game.columns if 'rolling' in c})
                 
-                games_train["diff_net_pass"] = games_train["home_epa_net_pass"] - games_train["away_epa_net_pass"]
-                games_train["diff_net_rush"] = games_train["home_epa_net_rush"] - games_train["away_epa_net_rush"]
+                games_train = games_train.merge(team_game, left_on=['season', 'week', 'away_team'], right_on=['season', 'week', 'team'], how='left', suffixes=('', '_away'))
+                games_train = games_train.rename(columns={c: f'away_{c}' for c in team_game.columns if 'rolling' in c})
+                
+                # Calculate Differentials using Rolling Stats
+                games_train['diff_net_pass'] = (games_train['home_rolling_pass_epa'] - games_train['home_rolling_pass_epa_def']) - \
+                                               (games_train['away_rolling_pass_epa'] - games_train['away_rolling_pass_epa_def'])
+                games_train['diff_net_rush'] = (games_train['home_rolling_rush_epa'] - games_train['home_rolling_rush_epa_def']) - \
+                                               (games_train['away_rolling_rush_epa'] - games_train['away_rolling_rush_epa_def'])
                 
                 def get_logit(r):
                     try: return logit(no_vig_two_way(american_to_decimal(r['home_moneyline']), american_to_decimal(r['away_moneyline']))[0])
                     except: return np.nan
                 games_train['logit_mkt'] = games_train.apply(get_logit, axis=1)
                 
-                # ADDED MISSING COLUMN TO DROPNA
                 train_clean = games_train.dropna(subset=['home_win', 'logit_mkt', 'diff_net_pass', 'diff_net_rush']).copy()
                 if not train_clean.empty:
                     clf = LogisticRegression()
