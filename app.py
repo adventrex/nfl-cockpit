@@ -1,5 +1,5 @@
 import streamlit as st
-import streamlit.components.v1 as components  # Moved to top for safety
+import streamlit.components.v1 as st_components  # Renamed for safety
 import pandas as pd
 import numpy as np
 import datetime
@@ -33,7 +33,7 @@ LOADING_HTML = """
     .title-block h1 { color: var(--primary-neon); text-transform: uppercase; letter-spacing: 0.15em; margin-bottom: 10px; text-shadow: 0 0 10px rgba(32, 247, 255, 0.5); }
     .progress-bar { width: 300px; height: 4px; background: #333; border-radius: 2px; overflow: hidden; position: relative; margin: 0 auto; }
     .progress-inner { position: absolute; top: 0; left: 0; height: 100%; width: 100%; background: var(--primary-neon); animation: progress 2s infinite ease-in-out; transform-origin: left; }
-    @keyframes progress { 0% { transform: scaleX(0); } 50% { transform: scaleX(0.7); } 100% { transform: scaleX(0); transform-origin: right; } }
+    @keyframes progress { 0% { transform: scaleX(0); } 50% { transform: scaleX(0.7); } 100% { transform: scaleX(0.7); transform-origin: right; } }
     .code-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; width: 100%; max-width: 800px; font-size: 10px; opacity: 0.7; text-align: left; }
     .code-col { border: 1px solid #333; padding: 10px; height: 150px; overflow: hidden; position: relative; background: #000; }
     .code-line { color: var(--accent-neon); white-space: nowrap; animation: scroll 3s infinite linear; }
@@ -75,7 +75,7 @@ LOADING_HTML = """
 # --- INITIALIZE LOADING ---
 loading_placeholder = st.empty()
 with loading_placeholder:
-    components.html(LOADING_HTML, height=450)
+    st_components.html(LOADING_HTML, height=450)
 
 # ==========================================
 # 1. SETUP & IMPORTS
@@ -336,12 +336,12 @@ def load_nfl_data():
                     weights = train_data['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                     clf.fit(X, y, sample_weight=weights)
 
-    return clf, team_stats_season, weekly, sched, qb_stats, hfa_dict, status_report, val_accuracy
+    return clf, team_stats_season, weekly, sched, qb_stats, hfa_dict, status, loaded_years, analysis_db
 
 # --- LOAD DATA ---
 loading_placeholder.empty()
-with loading_placeholder: components.html(LOADING_HTML, height=450)
-model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, hfa_db, status_rep, val_acc = load_nfl_data()
+with loading_placeholder: st_components.html(LOADING_HTML, height=450)
+model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, hfa_db, status_rep, loaded_years_list, analysis_db = load_nfl_data()
 live_odds_map = OddsService.fetch_live_odds()
 loading_placeholder.empty()
 
@@ -523,7 +523,7 @@ def render_game_card(i, row, bankroll, kelly):
             oh_i = st.number_input(f"{home}", value=oh, step=5, key=f"oh_{i}")
             dal, dhl = american_to_decimal(oa_i), american_to_decimal(oh_i)
             pmkt = no_vig_two_way(dhl, dal)[0]
-            st.progress(pmkt if pmkt>=0.5 else 1-pmkt, f"Mkt: {home if pmkt>=0.5 else away} {pmkt if pmkt>=0.5 else 1-pmkt:.1%}")
+            st.progress(pmkt if pmkt >= 0.5 else 1-pmkt, f"Mkt: {home if pmkt>=0.5 else away} {pmkt if pmkt>=0.5 else 1-pmkt:.1%}")
 
         with c_aw:
             st.markdown(f"##### {away}")
