@@ -571,8 +571,10 @@ def render_game_card(i, row, bankroll, kelly):
         
         if fp_home >= 0.5:
             pick, prob, odds = home, fp_home, dhl
+            dec_away_odds = dal # For 'da_live' equivalent usage
         else:
             pick, prob, odds = away, 1.0-fp_home, dal
+            dec_away_odds = dal
             
         edge = prob - (1/odds)
         ev = prob * odds - 1
@@ -583,11 +585,27 @@ def render_game_card(i, row, bankroll, kelly):
         
         with st.expander("Model Math"):
             for k,v in brk.items(): st.write(f"{k}: {v:+.1%}")
-            
+        
         max_w = bankroll * 0.05
+        # Use consistent variable name: max_w
         if z >= 1.28 and ev > 0:
             amt = half_kelly(prob, odds, bankroll)
+            amt = min(amt, max_w)
             st.success(f"BET {pick} ${amt:.0f}")
+        # Check other side just in case (Away EV check if Home is favored but bad value)
+        elif fp_home >= 0.5 and ((1-fp_home)*dec_away_odds - 1) > 0:
+             # This is the "Away side check"
+             # Use dec_away_odds instead of undefined da_live
+             prob_a = 1-fp_home
+             ev_a = prob_a * dec_away_odds - 1
+             edge_a = prob_a - (1/dec_away_odds)
+             z_a = edge_a / 0.04
+             if z_a >= 1.28:
+                 amt = half_kelly(prob_a, dec_away_odds, bankroll)
+                 amt = min(amt, max_w)
+                 st.success(f"BET {away} ${amt:.0f} (Contrarian Value)")
+             else:
+                 st.info("No Play")
         else:
             st.info("No Play")
             
