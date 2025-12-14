@@ -180,6 +180,78 @@ def compute_team_home_advantage(games, min_games=10, alpha=0.05, smooth=0.5):
         hfa_map[team] = (1.0 / (1.0 + np.exp(-delta / 2.0)) - 0.5) * shrink
     return hfa_map
 
+class OddsService:
+    TEAM_MAP = {
+        "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
+        "Carolina Panthers": "CAR", "Chicago Bears": "CHI", "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
+        "Dallas Cowboys": "DAL", "Denver Broncos": "DEN", "Detroit Lions": "DET", "Green Bay Packers": "GB",
+        "Houston Texans": "HOU", "Indianapolis Colts": "IND", "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
+        "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC", "Los Angeles Rams": "LA", "Miami Dolphins": "MIA",
+        "Minnesota Vikings": "MIN", "New England Patriots": "NE", "New Orleans Saints": "NO", "New York Giants": "NYG",
+        "New York Jets": "NYJ", "Philadelphia Eagles": "PHI", "Pittsburgh Steelers": "PIT", "San Francisco 49ers": "SF",
+        "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB", "Tennessee Titans": "TEN", "Washington Commanders": "WAS"
+    }
+    @staticmethod
+    @st.cache_data(ttl=3600)
+    def fetch_live_odds():
+        try:
+            url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?regions=us&markets=h2h&bookmakers=draftkings&apiKey={ODDS_API_KEY}"
+            response = requests.get(url, timeout=5)
+            if not response.ok: return {}
+            data = response.json()
+            live_data = {}
+            for game in data:
+                h_name, a_name = game.get('home_team'), game.get('away_team')
+                h_abbr, a_abbr = OddsService.TEAM_MAP.get(h_name), OddsService.TEAM_MAP.get(a_name)
+                if h_abbr and a_abbr and game['bookmakers']:
+                    dk = game['bookmakers'][0]
+                    outcomes = dk['markets'][0]['outcomes']
+                    h_price, a_price = None, None
+                    for outcome in outcomes:
+                        if outcome['name'] == h_name: h_price = outcome['price']
+                        elif outcome['name'] == a_name: a_price = outcome['price']
+                    def dec_to_amer(dec):
+                        if dec <= 1.0: return -10000
+                        return int((dec - 1) * 100) if dec >= 2.0 else int(-100 / (dec - 1))
+                    if h_price and a_price:
+                        live_data[(h_abbr, a_abbr)] = {'home_am': dec_to_amer(h_price), 'away_am': dec_to_amer(a_price)}
+            return live_data
+        except: return {}
+
+class StadiumService:
+    STADIUMS = {
+        "ARI": {"lat": 33.5276, "lon": -112.2626, "type": "retractable"}, "ATL": {"lat": 33.7554, "lon": -84.4010, "type": "retractable"},
+        "BAL": {"lat": 39.2780, "lon": -76.6227, "type": "open"}, "BUF": {"lat": 42.7738, "lon": -78.7870, "type": "open"},
+        "CAR": {"lat": 35.2258, "lon": -80.8528, "type": "open"}, "CHI": {"lat": 41.8623, "lon": -87.6167, "type": "open"},
+        "CIN": {"lat": 39.0955, "lon": -84.5161, "type": "open"}, "CLE": {"lat": 41.5061, "lon": -81.6995, "type": "open"},
+        "DAL": {"lat": 32.7473, "lon": -97.0945, "type": "retractable"}, "DEN": {"lat": 39.7439, "lon": -105.0201, "type": "open"},
+        "DET": {"lat": 42.3400, "lon": -83.0456, "type": "dome"}, "GB":  {"lat": 44.5013, "lon": -88.0622, "type": "open"},
+        "HOU": {"lat": 29.6847, "lon": -95.4107, "type": "retractable"}, "IND": {"lat": 39.7601, "lon": -86.1639, "type": "retractable"},
+        "JAX": {"lat": 30.3240, "lon": -81.6373, "type": "open"}, "KC":  {"lat": 39.0489, "lon": -94.4839, "type": "open"},
+        "LV":  {"lat": 36.0909, "lon": -115.1833, "type": "dome"}, "LAC": {"lat": 33.9535, "lon": -118.3390, "type": "dome"},
+        "LA":  {"lat": 33.9535, "lon": -118.3390, "type": "dome"}, "MIA": {"lat": 25.9580, "lon": -80.2389, "type": "open"},
+        "MIN": {"lat": 44.9735, "lon": -93.2575, "type": "dome"}, "NE":  {"lat": 42.0909, "lon": -71.2643, "type": "open"},
+        "NO":  {"lat": 29.9511, "lon": -90.0812, "type": "dome"}, "NYG": {"lat": 40.8135, "lon": -74.0745, "type": "open"},
+        "NYJ": {"lat": 40.8135, "lon": -74.0745, "type": "open"}, "PHI": {"lat": 39.9008, "lon": -75.1675, "type": "open"},
+        "PIT": {"lat": 40.4468, "lon": -80.0158, "type": "open"}, "SF":  {"lat": 37.4032, "lon": -121.9698, "type": "open"},
+        "SEA": {"lat": 47.5952, "lon": -122.3316, "type": "open"}, "TB":  {"lat": 27.9759, "lon": -82.5033, "type": "open"},
+        "TEN": {"lat": 36.1665, "lon": -86.7713, "type": "open"}, "WAS": {"lat": 38.9077, "lon": -76.8645, "type": "open"}
+    }
+    @staticmethod
+    @st.cache_data(ttl=3600)
+    def get_forecast(team_abbr, date_obj):
+        stadium = StadiumService.STADIUMS.get(team_abbr)
+        if not stadium: return None
+        if stadium['type'] in ['dome', 'retractable']: return {"desc": "🏟️ Stadium Closed/Dome", "is_closed": True, "temp": 72, "wind": 0, "rain": 0}
+        try:
+            date_str = date_obj.strftime("%Y-%m-%d")
+            url = f"https://api.open-meteo.com/v1/forecast?latitude={stadium['lat']}&longitude={stadium['lon']}&daily=temperature_2m_max,precipitation_probability_max,windspeed_10m_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&start_date={date_str}&end_date={date_str}"
+            res = requests.get(url, timeout=5).json()
+            if 'daily' in res:
+                return {"desc": f"🌡️ {res['daily']['temperature_2m_max'][0]}°F  💨 {res['daily']['windspeed_10m_max'][0]} mph", "is_closed": False, "temp": res['daily']['temperature_2m_max'][0], "wind": res['daily']['windspeed_10m_max'][0], "rain": res['daily']['precipitation_probability_max'][0]}
+        except: pass
+        return {"desc": "Weather Unavailable", "is_closed": False, "temp": 70, "wind": 5, "rain": 0}
+
 @st.cache_resource(ttl=3600)
 def load_nfl_data():
     current_year = datetime.date.today().year
@@ -424,6 +496,11 @@ class CockpitEngine:
         return qb_stats_db[qb_stats_db['posteam']==team_abbr].head(1).iloc[0] if not qb_stats_db[qb_stats_db['posteam']==team_abbr].empty else None
 
     @staticmethod
+    def get_default_sliders(row, weather_data):
+        # Neutral defaults
+        return {'a_qb': 5, 'a_pwr': 5, 'a_def': 5, 'h_qb': 5, 'h_pwr': 5, 'h_def': 5, 'rest': 5, 'news': 5, 'weath': 0, 'hfa': 5}
+
+    @staticmethod
     def calc_win_prob(market_prob, row, sliders):
         logit_mkt = logit(market_prob)
         def epa(v): return (v - 5) * 0.03
@@ -497,6 +574,9 @@ def render_strategy_lab(bankroll):
 def render_game_card(i, row, bankroll, kelly):
     home, away = row['home_team'], row['away_team']
     
+    # Date Picker and Filtering (Task List Item)
+    # The sel_date is globally available from top of script
+
     def safe_int(v):
         try: return int(v)
         except: return -110
@@ -519,6 +599,7 @@ def render_game_card(i, row, bankroll, kelly):
     a_qb = CockpitEngine.get_qb_metrics(away) 
     weather_info = StadiumService.get_forecast(home, sel_date)
     defs = CockpitEngine.get_default_sliders(row, weather_info)
+    season = row['season']
 
     with st.container(border=True):
         if not analysis_db.empty:
@@ -618,6 +699,10 @@ def render_game_card(i, row, bankroll, kelly):
         g = CockpitEngine.get_simple_gold_prediction(home, away, season)
         if g:
             st.caption(f"Gold Standard: {home} {g['h_score']:.1f} - {away} {g['a_score']:.1f}")
+
+# --- DATE SELECTION (Moved outside sidebar for visibility) ---
+c_date, c_status = st.columns([1, 3])
+sel_date = c_date.date_input("📅 Select Game Date", datetime.date.today())
 
 with st.sidebar:
     st.title("🏈 NFL Cockpit")
