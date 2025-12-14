@@ -441,7 +441,7 @@ def load_nfl_data():
                 if not train_clean.empty:
                     clf = LogisticRegression()
                     # WEIGHT: 3x for current season
-                    train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
+                    train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else (1.0 if x == current_year - 1 else 0.5))
                     clf.fit(train_clean[['logit_mkt', 'diff_net_pass', 'diff_net_rush']], train_clean['home_win'], sample_weight=train_clean['weight'])
 
     return clf, team_stats, weekly, sched, qb_stats, hfa_dict, status, loaded_years, analysis_db
@@ -500,7 +500,9 @@ class CockpitEngine:
                 leaders['QB'] = {'name': name, 'raw_yds': val, 'stat': f"Last: {val} yds"}
         
         # RB/WR: Hot hand from last game
-        last_g = curr_rows[curr_rows['week'] == weeks[0]]
+        last_g_week = weeks[0] if weeks else 0
+        last_g = curr_rows[curr_rows['week'] == last_g_week]
+        
         if not last_g.empty:
             rb = last_g.sort_values('rushing_yards', ascending=False).head(1)
             if not rb.empty: leaders['RB'] = {'name': rb.iloc[0]['player_display_name'], 'raw_yds': rb.iloc[0]['rushing_yards'], 'stat': f"Last: {rb.iloc[0]['rushing_yards']} yds"}
@@ -517,6 +519,9 @@ class CockpitEngine:
         if 'QB' in leaders:
             name = leaders['QB']['name']
             row = qb_stats_db[(qb_stats_db['season']==season) & (qb_stats_db['posteam']==team_abbr) & (qb_stats_db['passer_player_name']==name)]
+            if not row.empty: return row.iloc[0]
+            # Try to find recent stats for this QB even if not current season in pbp aggregate
+            row = qb_stats_db[(qb_stats_db['posteam']==team_abbr) & (qb_stats_db['passer_player_name']==name)].sort_values('season', ascending=False)
             if not row.empty: return row.iloc[0]
 
         # Fallback
@@ -690,6 +695,7 @@ def render_game_card(i, row, bankroll, kelly):
         c1.subheader(f"{away} @ {home}")
         c1.caption(f"{row['gametime']} ET")
         if weather_info: c1.caption(f"{weather_info['desc']}")
+        
         if hold > 0.05: c1.caption(f"⚠️ High Hold: {hold:.1%}")
 
         with c2:
@@ -727,53 +733,59 @@ def render_game_card(i, row, bankroll, kelly):
 
         with c_aw:
             st.markdown(f"##### {away}")
-            pa_qb = st.slider("QB", 0, 10, defs['a_qb'], key=f"pq_{i}")
-            pa_pwr = st.slider("Pwr", 0, 10, defs['a_pwr'], key=f"pp_{i}")
-            pa_def = st.slider("Def", 0, 10, defs['a_def'], key=f"pd_{i}")
+            pa_qb = st.slider("QB", 0, 10, defs['a_qb'], key=f"pq_{i}", help="0=Bench, 5=Avg, 10=MVP")
+            pa_pwr = st.slider("Pwr", 0, 10, defs['a_pwr'], key=f"pp_{i}", help="Run Game/O-Line Strength")
+            pa_def = st.slider("Def", 0, 10, defs['a_def'], key=f"pd_{i}", help="Ability to stop scores")
 
         with c_hm:
             st.markdown(f"##### {home}")
-            ph_qb = st.slider("QB", 0, 10, defs['h_qb'], key=f"hq_{i}")
-            ph_pwr = st.slider("Pwr", 0, 10, defs['h_pwr'], key=f"hp_{i}")
-            ph_def = st.slider("Def", 0, 10, defs['h_def'], key=f"hd_{i}")
+            ph_qb = st.slider("QB", 0, 10, defs['h_qb'], key=f"hq_{i}", help="0=Bench, 5=Avg, 10=MVP")
+            ph_pwr = st.slider("Pwr", 0, 10, defs['h_pwr'], key=f"hp_{i}", help="Run Game/O-Line Strength")
+            ph_def = st.slider("Def", 0, 10, defs['h_def'], key=f"hd_{i}", help="Ability to stop scores")
             
         st.markdown("##### Context")
         cc1, cc2, cc3, cc4 = st.columns(4)
         wr = st.slider("Rest", 0, 10, defs['rest'], key=f"r_{i}", help="5=Neutral")
         wn = st.slider("News", 0, 10, defs['news'], key=f"n_{i}", help="0=Home Good, 10=Away Good")
-        hfa = st.slider("HFA", 0, 10, defs['hfa'], key=f"h_{i}")
+        hfa = st.slider("HFA", 0, 10, defs['hfa'], key=f"h_{i}", help="Auto-calculated advantage from history")
         wd = weather_info and weather_info['is_closed']
-        ww = st.slider("Weather", 0, 10, defs['weath'], disabled=wd, key=f"w_{i}")
+        ww = st.slider("Weather", 0, 10, defs['weath'], disabled=wd, key=f"w_{i}", help="5=Bad Weather (Wind/Rain)")
         if wd: cc4.caption("Indoor")
 
         with c_res:
             sl = {'pa_qb': pa_qb, 'pa_pwr': pa_pwr, 'pa_def': pa_def, 'ph_qb': ph_qb, 'ph_pwr': ph_pwr, 'ph_def': ph_def, 'wr': wr, 'wn': wn, 'ww': ww, 'hfa': hfa, 'rh': row.get('home_rest',7), 'ra': row.get('away_rest',7)}
-            final_p, breakdown = CockpitEngine.calc_win_prob(pmkt, row, sl)
+            final_p_home, breakdown = CockpitEngine.calc_win_prob(pmkt, row, sl)
             
             # Determine Verdict Side
-            if final_p >= 0.5:
-                pick, prob, odds, bet_team = home, final_p, dhl, home
+            if final_p_home >= 0.5:
+                pick_team = home
+                pick_prob = final_p_home
+                pick_odds = dhl
                 mkt_ref = pmkt 
             else:
-                pick, prob, odds, bet_team = away, 1.0 - final_p, dal, away
+                pick_team = away
+                pick_prob = 1.0 - final_p_home
+                pick_odds = dal
                 mkt_ref = 1.0 - pmkt 
             
-            p_be = 1 / odds
-            edge = prob - p_be
-            ev = prob * odds - 1
-            z = edge / 0.04
+            p_be = 1 / pick_odds
+            edge = pick_prob - p_be
+            se_p = 0.04 
+            z_score = edge / se_p
+            ev = pick_prob * pick_odds - 1
             
             st.markdown("##### 🚀 Verdict")
-            st.markdown(f"**Pick:** {pick}")
-            st.metric("Prob", f"{prob:.1%}", delta=f"{prob-mkt_ref:.1%}")
+            st.markdown(f"**Pick:** {pick_team}")
+            st.metric("Prob", f"{pick_prob:.1%}", delta=f"{pick_prob-mkt_ref:.1%}")
             
             with st.expander("Math"):
                 for k,v in breakdown.items(): st.write(f"{k}: {v:+.1%}")
             
             max_w = bankroll * 0.05
-            if z >= 1.28 and ev > 0:
-                s = min(half_kelly(prob, odds) * bankroll * kelly, max_w)
-                st.success(f"BET {pick} ${s:.0f}")
+            if z_score >= 1.28 and ev > 0:
+                stake = half_kelly(pick_prob, pick_odds) * bankroll * kelly
+                stake = min(stake, max_wager_val)
+                st.success(f"BET {pick_team} ${stake:.0f}")
             else:
                 if ev > 0: st.warning("Weak Edge")
                 else: st.info("No Edge")
@@ -791,79 +803,9 @@ def render_game_card(i, row, bankroll, kelly):
             st.session_state['sl_active'] = True
             st.session_state['sl_home'] = home
             st.session_state['sl_away'] = away
-            st.session_state['sl_h_prob'] = final_p
+            st.session_state['sl_h_prob'] = final_p_home
             st.session_state['sl_legs'] = []
             st.rerun()
-
-# ==========================================
-# 9. STRATEGY LAB UI
-# ==========================================
-def render_strategy_lab(bankroll):
-    st.markdown(f"## 🧠 Strategy Lab: {st.session_state['sl_away']} @ {st.session_state['sl_home']}")
-    if st.button("← Back to Schedule"):
-        st.session_state['sl_active'] = False
-        st.rerun()
-    home = st.session_state['sl_home']
-    away = st.session_state['sl_away']
-    h_prob = st.session_state['sl_h_prob']
-    
-    a_prob = 1.0 - h_prob
-    
-    if 'sl_pool' not in st.session_state or not st.session_state['sl_legs']:
-        st.session_state['sl_pool'] = CockpitEngine.generate_props(home, away, h_prob, a_prob)
-    all_props = st.session_state['sl_pool']
-    current_legs = st.session_state['sl_legs']
-    MAX_LEGS = 4
-    st.divider()
-    c_build, c_ticket = st.columns([2, 1])
-    with c_build:
-        if len(current_legs) == 0:
-            st.subheader("Step 1: Pick the Winner")
-            c1, c2 = st.columns(2)
-            h_ml = next((p for p in all_props if p.description == f"{home} To Win"), None)
-            a_ml = next((p for p in all_props if p.description == f"{away} To Win"), None)
-            if h_ml and c1.button(f"🏆 {home}"):
-                st.session_state['sl_legs'].append(h_ml)
-                st.rerun()
-            if a_ml and c2.button(f"🏆 {away}"):
-                st.session_state['sl_legs'].append(a_ml)
-                st.rerun()
-        elif len(current_legs) < MAX_LEGS:
-            last_leg = current_legs[-1]
-            st.subheader(f"Next Step: What correlates with {last_leg.description}?")
-            fits = parlay.ParlayMath.find_best_additions(current_legs, all_props, top_n=3)
-            if fits:
-                cols = st.columns(3)
-                for idx, leg in enumerate(fits):
-                    with cols[idx]:
-                        with st.container(border=True):
-                            st.markdown(f"**{leg.description}**")
-                            st.caption(f"Type: {leg.category}")
-                            st.markdown(f"*:gray[{leg.recent_stat}]*") 
-                            if st.button("➕ Add", key=f"add_{leg.leg_id}_{len(current_legs)}"):
-                                st.session_state['sl_legs'].append(leg)
-                                st.rerun()
-            else: st.info("No more high-correlation props found.")
-        else: st.success(f"Ticket Full ({MAX_LEGS} Legs).")
-            
-        if len(current_legs) > 0:
-            if st.button("🔄 Reset Ticket"):
-                st.session_state['sl_legs'] = []
-                st.rerun()
-    with c_ticket:
-        st.markdown("### 🎫 Ticket")
-        if current_legs:
-            res = parlay.ParlayMath.calculate_ticket(current_legs, bankroll)
-            for i, leg in enumerate(current_legs): st.write(f"{i+1}. {leg.description}")
-            st.divider()
-            st.metric("Odds", f"{res.final_odds:.2f}")
-            st.metric("Win Prob", f"{res.win_prob:.1%}")
-            if res.ev > 0:
-                st.success(f"**EV: +{res.ev:.1%}**")
-                st.markdown(f"### Bet: ${res.kelly_stake:.0f}")
-            else: st.warning(f"EV: {res.ev:.1%}")
-            st.caption(f"Targeting {MAX_LEGS}-Leg SGP")
-        else: st.info("Empty")
 
 if st.session_state.get('sl_active', False):
     render_strategy_lab(bankroll)
