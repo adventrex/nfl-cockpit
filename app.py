@@ -352,7 +352,7 @@ def load_nfl_data():
                     weights = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                     clf.fit(X, y, sample_weight=weights)
 
-    return clf, team_stats, weekly, sched, qb_stats, hfa_dict, status, loaded_years, analysis_db, val_accuracy
+    return clf, team_stats, weekly, sched, qb_stats, hfa_dict, status_report, loaded_years, analysis_db, val_accuracy
 
 # --- LOAD DATA ---
 loading_placeholder.empty()
@@ -508,6 +508,9 @@ def render_game_card(i, row, bankroll, kelly):
         src = "DraftKings (Live)"
     else: src = "Schedule (Cached)"
 
+    # Live decimal odds now available
+    dhl, dal = american_to_decimal(oh), american_to_decimal(oa)
+
     h_qb = CockpitEngine.get_qb_metrics(home) 
     a_qb = CockpitEngine.get_qb_metrics(away) 
     weather_info = StadiumService.get_forecast(home, sel_date)
@@ -535,9 +538,9 @@ def render_game_card(i, row, bankroll, kelly):
         st.divider()
         
         c_odds, c_aw, c_hm = st.columns([1, 1, 1])
-        # Ensure da_live/dh_live are available to the rest of the function
         oa_i = st.number_input(f"{away}", value=oa, step=5, key=f"oa_{i}")
         oh_i = st.number_input(f"{home}", value=oh, step=5, key=f"oh_{i}")
+        # Recalc odds if user changed input
         dal, dhl = american_to_decimal(oa_i), american_to_decimal(oh_i)
         pmkt = no_vig_two_way(dhl, dal)[0]
 
@@ -569,9 +572,10 @@ def render_game_card(i, row, bankroll, kelly):
         sl = {'pa_qb': pa_qb, 'pa_pwr': pa_pwr, 'pa_def': pa_def, 'ph_qb': ph_qb, 'ph_pwr': ph_pwr, 'ph_def': ph_def, 'wr': wr, 'wn': wn, 'ww': ww, 'hfa': hfa, 'rh': row.get('home_rest',7), 'ra': row.get('away_rest',7)}
         fp_home, brk = CockpitEngine.calc_win_prob(pmkt, row, sl)
         
+        # Decide who to display
         if fp_home >= 0.5:
             pick, prob, odds = home, fp_home, dhl
-            dec_away_odds = dal # For 'da_live' equivalent usage
+            dec_away_odds = dal
         else:
             pick, prob, odds = away, 1.0-fp_home, dal
             dec_away_odds = dal
@@ -585,17 +589,15 @@ def render_game_card(i, row, bankroll, kelly):
         
         with st.expander("Model Math"):
             for k,v in brk.items(): st.write(f"{k}: {v:+.1%}")
-        
+            
         max_w = bankroll * 0.05
-        # Use consistent variable name: max_w
+        # Standardized check
         if z >= 1.28 and ev > 0:
             amt = half_kelly(prob, odds, bankroll)
             amt = min(amt, max_w)
             st.success(f"BET {pick} ${amt:.0f}")
-        # Check other side just in case (Away EV check if Home is favored but bad value)
         elif fp_home >= 0.5 and ((1-fp_home)*dec_away_odds - 1) > 0:
-             # This is the "Away side check"
-             # Use dec_away_odds instead of undefined da_live
+             # This handles the Away side check if Home is favored
              prob_a = 1-fp_home
              ev_a = prob_a * dec_away_odds - 1
              edge_a = prob_a - (1/dec_away_odds)
