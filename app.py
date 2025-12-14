@@ -4,6 +4,7 @@ import numpy as np
 import datetime
 import math
 import requests
+import streamlit.components.v1 as components
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 from sklearn.linear_model import LogisticRegression
@@ -517,7 +518,7 @@ def render_game_card(i, row, bankroll, kelly):
             oh_i = st.number_input(f"{home}", value=oh, step=5, key=f"oh_{i}")
             dal, dhl = american_to_decimal(oa_i), american_to_decimal(oh_i)
             pmkt = no_vig_two_way(dhl, dal)[0]
-            st.progress(pmkt if pmkt>=0.5 else 1-pmkt, f"Imp: {pmkt if pmkt>=0.5 else 1-pmkt:.1%}")
+            st.progress(pmkt if pmkt>=0.5 else 1-pmkt, f"Mkt: {home if pmkt>=0.5 else away} {pmkt if pmkt>=0.5 else 1-pmkt:.1%}")
 
         with c_aw:
             st.markdown(f"##### {away}")
