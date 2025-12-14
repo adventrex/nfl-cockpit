@@ -1,10 +1,10 @@
 import streamlit as st
+import streamlit.components.v1 as components  # Moved to top for safety
 import pandas as pd
 import numpy as np
 import datetime
 import math
 import requests
-import streamlit.components.v1 as components
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 from sklearn.linear_model import LogisticRegression
@@ -223,9 +223,14 @@ def load_nfl_data():
     weekly = pd.concat(weekly_all, ignore_index=True) if weekly_all else pd.DataFrame()
 
     clf, team_stats_season, qb_stats = None, pd.DataFrame(), pd.DataFrame()
+    hfa_dict = {}
     val_accuracy = 0.0
 
     if not pbp.empty:
+        # HFA
+        try: hfa_dict = compute_team_home_advantage(nfl.import_schedules([current_year-3, current_year-2, current_year-1]))
+        except: pass
+
         # --- FEATURE ENGINEERING: ROLLING STATS (CORRECTED) ---
         pbp['game_date'] = pd.to_datetime(pbp['game_date'])
         
@@ -331,12 +336,12 @@ def load_nfl_data():
                     weights = train_data['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                     clf.fit(X, y, sample_weight=weights)
 
-    return clf, team_stats_season, weekly, sched, qb_stats, status_report, val_accuracy
+    return clf, team_stats_season, weekly, sched, qb_stats, hfa_dict, status_report, val_accuracy
 
 # --- LOAD DATA ---
 loading_placeholder.empty()
 with loading_placeholder: components.html(LOADING_HTML, height=450)
-model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, status_rep, val_acc = load_nfl_data()
+model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, hfa_db, status_rep, val_acc = load_nfl_data()
 live_odds_map = OddsService.fetch_live_odds()
 loading_placeholder.empty()
 
