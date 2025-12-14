@@ -758,18 +758,17 @@ def render_game_card(i, row, bankroll, kelly):
                 pick_team = home
                 pick_prob = final_p_home
                 pick_odds = dhl
-                mkt_ref = pmkt # Home market prob
+                mkt_ref = pmkt 
             else:
                 pick_team = away
                 pick_prob = 1.0 - final_p_home
                 pick_odds = dal
-                mkt_ref = 1.0 - pmkt # Away market prob
+                mkt_ref = 1.0 - pmkt 
             
             p_be = 1 / pick_odds
             edge = pick_prob - p_be
-            se_p = 0.04 
-            z_score = edge / se_p
             ev = pick_prob * pick_odds - 1
+            z = edge / 0.04
             
             st.markdown("##### 🚀 Verdict")
             st.markdown(f"**Pick:** {pick_team}")
@@ -780,15 +779,10 @@ def render_game_card(i, row, bankroll, kelly):
             
             max_w = bankroll * 0.05
             
-            if z_score >= 1.28 and ev > 0:
+            if z >= 1.28 and ev > 0:
                 stake = half_kelly(pick_prob, pick_odds) * bankroll * kelly
                 stake = min(stake, max_w)
                 st.success(f"BET {pick_team} ${stake:.0f}")
-            elif ((1-final_p_home)*da_live - 1) > 0 and (-(edge) / se_p) >= 1.28:
-                 # Inverse for Away
-                 stake = half_kelly(1-final_p_home, da_live) * bankroll * kelly
-                 stake = min(stake, max_w)
-                 st.success(f"BET {away} ${stake:.0f}")
             else:
                 if ev > 0: st.warning("Weak Edge")
                 else: st.info("No Edge")
