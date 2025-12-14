@@ -135,6 +135,7 @@ def half_kelly(p, d, bankroll, max_fraction=0.05):
     q = 1 - p
     f_full = (b * p - q) / b
     if f_full <= 0: return 0.0
+    
     f_half = f_full * 0.5
     f_final = min(f_half, max_fraction)
     return f_final * bankroll
@@ -212,6 +213,7 @@ def load_nfl_data():
     pbp_all, weekly_all = [], []
     status_report = {}
     hfa_dict = {}
+    loaded_years = [] # FIX: Initialized here!
     
     # HFA
     try: hfa_dict = compute_team_home_advantage(nfl.import_schedules([current_year-3, current_year-2, current_year-1]))
@@ -228,7 +230,9 @@ def load_nfl_data():
             w = try_load_nflverse_csv(f"https://github.com/nflverse/nflverse-data/releases/download/stats_player_week/stats_player_week_{yr}.csv.gz", "Weekly", status_report, yr)
             if yr not in status_report: status_report[yr] = "✅ CSV" if not p.empty else "❌ Fail"
             
-        if p is not None and not p.empty: pbp_all.append(p)
+        if p is not None and not p.empty: 
+            pbp_all.append(p)
+            loaded_years.append(yr) # FIX: Track loaded years
         if w is not None and not w.empty: weekly_all.append(w)
 
     pbp = pd.concat(pbp_all, ignore_index=True) if pbp_all else pd.DataFrame()
