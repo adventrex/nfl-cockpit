@@ -1,5 +1,5 @@
 import streamlit as st
-import streamlit.components.v1 as st_components  # Renamed for safety
+import streamlit.components.v1 as components  # Reverted to standard naming
 import pandas as pd
 import numpy as np
 import datetime
@@ -75,7 +75,7 @@ LOADING_HTML = """
 # --- INITIALIZE LOADING ---
 loading_placeholder = st.empty()
 with loading_placeholder:
-    st_components.html(LOADING_HTML, height=450)
+    components.html(LOADING_HTML, height=450)
 
 # ==========================================
 # 1. SETUP & IMPORTS
@@ -340,14 +340,14 @@ def load_nfl_data():
 
 # --- LOAD DATA ---
 loading_placeholder.empty()
-with loading_placeholder: st_components.html(LOADING_HTML, height=450)
+with loading_placeholder: components.html(LOADING_HTML, height=450)
 model_clf, team_stats_db, weekly_stats_db, sched_db, qb_stats_db, hfa_db, status_rep, loaded_years_list, analysis_db = load_nfl_data()
 live_odds_map = OddsService.fetch_live_odds()
 loading_placeholder.empty()
 
 # --- SIDEBAR DIAGNOSTICS ---
 with st.sidebar:
-    st.markdown("### 💾 Data Health")
+    st.markdown("### 💾 Data Diagnostics")
     for k, v in status_rep.items(): st.sidebar.caption(f"**{k}:** {v}")
     
     st.divider()
@@ -365,33 +365,50 @@ class CockpitEngine:
     @staticmethod
     def get_team_leaders(team_abbr):
         if weekly_stats_db.empty: return {}
-        # Safety check columns
         req = {'recent_team','passing_yards','rushing_yards','receiving_yards','player_display_name','week','season','attempts'}
-        if not req.issubset(set(weekly_stats_db.columns)): return {}
+        if not req.issubset(set(weekly_stats_db.columns)):
+             if 'attempts' not in weekly_stats_db.columns: return {} # need attempts
 
         team_rows = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr]
         if team_rows.empty: return {}
 
-        # Last 3 Weeks Logic
+        # 1. Find Max Season
         max_s = team_rows['season'].max()
         curr_rows = team_rows[team_rows['season'] == max_s]
+        
+        # 2. Find LAST 3 WEEKS played (Volume Check)
         weeks = sorted(curr_rows['week'].unique(), reverse=True)
         recent_3 = weeks[:3]
         recent_data = curr_rows[curr_rows['week'].isin(recent_3)]
         
         leaders = {}
-        # QB Selection
+        
+        # QB: Sum attempts over last 3 games to find starter
         if 'attempts' in recent_data.columns:
-             qb_starter = recent_data.groupby('player_display_name')['attempts'].sum().reset_index().sort_values('attempts', ascending=False).head(1)
+            qb_cand = recent_data.groupby('player_display_name')['attempts'].sum().reset_index()
+            qb_starter = qb_cand.sort_values('attempts', ascending=False).head(1)
         else:
-             qb_starter = recent_data.groupby('player_display_name')['passing_yards'].sum().reset_index().sort_values('passing_yards', ascending=False).head(1)
+             qb_cand = recent_data.groupby('player_display_name')['passing_yards'].sum().reset_index()
+             qb_starter = qb_cand.sort_values('passing_yards', ascending=False).head(1)
 
         if not qb_starter.empty:
             name = qb_starter.iloc[0]['player_display_name']
+            # Get stats from most recent game for that player
             p_stats = curr_rows[curr_rows['player_display_name'] == name].sort_values('week', ascending=False).head(1)
             if not p_stats.empty:
-                leaders['QB'] = {'name': name, 'raw_yds': p_stats.iloc[0]['passing_yards']}
+                val = p_stats.iloc[0]['passing_yards']
+                leaders['QB'] = {'name': name, 'raw_yds': val, 'stat': f"Last: {val} yds"}
         
+        # RB/WR: Hot hand from last game
+        last_g_week = weeks[0] if weeks else 0
+        last_g = curr_rows[curr_rows['week'] == last_g_week]
+        
+        if not last_g.empty:
+            rb = last_g.sort_values('rushing_yards', ascending=False).head(1)
+            if not rb.empty: leaders['RB'] = {'name': rb.iloc[0]['player_display_name'], 'raw_yds': rb.iloc[0]['rushing_yards'], 'stat': f"Last: {rb.iloc[0]['rushing_yards']} yds"}
+            wr = last_g.sort_values('receiving_yards', ascending=False).head(1)
+            if not wr.empty: leaders['WR'] = {'name': wr.iloc[0]['player_display_name'], 'raw_yds': wr.iloc[0]['receiving_yards'], 'stat': f"Last: {wr.iloc[0]['receiving_yards']} yds"}
+            
         return leaders
 
     @staticmethod
@@ -487,6 +504,7 @@ def render_strategy_lab(bankroll):
 # ==========================================
 def render_game_card(i, row, bankroll, kelly):
     home, away = row['home_team'], row['away_team']
+    season = row['season']
     
     def safe_int(v):
         try: return int(v)
@@ -496,12 +514,27 @@ def render_game_card(i, row, bankroll, kelly):
     dh, da = american_to_decimal(oh), american_to_decimal(oa)
     hold = synthetic_hold(dh, da)
     
+    live = live_odds_map.get((home, away))
+    if not live: live = live_odds_map.get((away, home))
+    if live: 
+        oh, oa = live['home_am'], live['away_am']
+        src = "DraftKings (Live)"
+    else: src = "Schedule (Cached)"
+
     h_qb = CockpitEngine.get_qb_metrics(home) 
     a_qb = CockpitEngine.get_qb_metrics(away) 
     
     defs = CockpitEngine.get_default_sliders(row, {})
 
     with st.container(border=True):
+        # Manual Analysis
+        if not analysis_db.empty:
+             match = analysis_db[(analysis_db['home']==home) & (analysis_db['away']==away)]
+             if not match.empty:
+                 with st.expander("🔍 Expert Analysis"):
+                     st.info(f"**{match.iloc[0]['edge_blurb']}**")
+                     if pd.notnull(match.iloc[0]['deep_dive_link']): st.markdown(f"[Read More]({match.iloc[0]['deep_dive_link']})")
+
         c1, c2 = st.columns([3, 1])
         c1.subheader(f"{away} @ {home}")
         c1.caption(f"{row['gametime']} ET")
@@ -512,6 +545,15 @@ def render_game_card(i, row, bankroll, kelly):
             n_h = h_qb['passer_player_name'] if h_qb is not None else 'Unknown'
             n_a = a_qb['passer_player_name'] if a_qb is not None else 'Unknown'
             st.caption(f"{n_a} vs {n_h}")
+
+        with st.expander("See QB Stats"):
+             c_qa, c_qh = st.columns(2)
+             if a_qb is not None:
+                 c_qa.markdown(f"**{a_qb['passer_player_name']}** ({away})")
+                 c_qa.metric("EPA", f"{a_qb['qb_epa']:.2f}")
+             if h_qb is not None:
+                 c_qh.markdown(f"**{h_qb['passer_player_name']}** ({home})")
+                 c_qh.metric("EPA", f"{h_qb['qb_epa']:.2f}")
 
         st.divider()
         
@@ -527,23 +569,23 @@ def render_game_card(i, row, bankroll, kelly):
 
         with c_aw:
             st.markdown(f"##### {away}")
-            pa_qb = st.slider("QB", 0, 10, defs['a_qb'], key=f"pq_{i}")
-            pa_pwr = st.slider("Off", 0, 10, defs['a_pwr'], key=f"pp_{i}")
-            pa_def = st.slider("Def", 0, 10, defs['a_def'], key=f"pd_{i}")
+            pa_qb = st.slider("QB", 0, 10, defs['a_qb'], key=f"pq_{i}", help="0=Bench, 5=Avg, 10=MVP")
+            pa_pwr = st.slider("Off", 0, 10, defs['a_pwr'], key=f"pp_{i}", help="Run Game/O-Line Strength")
+            pa_def = st.slider("Def", 0, 10, defs['a_def'], key=f"pd_{i}", help="Ability to stop scores")
 
         with c_hm:
             st.markdown(f"##### {home}")
-            ph_qb = st.slider("QB", 0, 10, defs['h_qb'], key=f"hq_{i}")
-            ph_pwr = st.slider("Off", 0, 10, defs['h_pwr'], key=f"hp_{i}")
-            ph_def = st.slider("Def", 0, 10, defs['h_def'], key=f"hd_{i}")
+            ph_qb = st.slider("QB", 0, 10, defs['h_qb'], key=f"hq_{i}", help="0=Bench, 5=Avg, 10=MVP")
+            ph_pwr = st.slider("Off", 0, 10, defs['h_pwr'], key=f"hp_{i}", help="Run Game/O-Line Strength")
+            ph_def = st.slider("Def", 0, 10, defs['h_def'], key=f"hd_{i}", help="Ability to stop scores")
             
         # Context
         st.markdown("##### Context")
         cc1, cc2, cc3, cc4 = st.columns(4)
         wr = cc1.slider("Rest", 0, 10, defs['rest'], key=f"r_{i}", help="5=Neutral")
         wn = cc2.slider("News", 0, 10, defs['news'], key=f"n_{i}", help="5=Neutral")
-        hfa = cc3.slider("HFA", 0, 10, defs['hfa'], key=f"h_{i}")
-        ww = cc4.slider("Weather", 0, 10, defs['weath'], key=f"w_{i}")
+        hfa = cc3.slider("HFA", 0, 10, defs['hfa'], key=f"h_{i}", help="Auto-calculated advantage from history")
+        ww = cc4.slider("Weather", 0, 10, defs['weath'], key=f"w_{i}", help="5=Bad Weather (Wind/Rain)")
 
         # Verdict
         sl = {'pa_qb': pa_qb, 'pa_pwr': pa_pwr, 'pa_def': pa_def, 'ph_qb': ph_qb, 'ph_pwr': ph_pwr, 'ph_def': ph_def, 'wr': wr, 'wn': wn, 'ww': ww, 'hfa': hfa, 'rh': row.get('home_rest',7), 'ra': row.get('away_rest',7)}
