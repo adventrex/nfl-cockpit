@@ -99,6 +99,7 @@ ODDS_API_KEY = "bb2b1af235a1f0273f9b085b82d6be81"
 try:
     import nfl_data_py as nfl
     from sklearn.linear_model import LogisticRegression
+    import parlay_engine as parlay
 except ImportError as e:
     st.error(f"Missing Libraries: {e}. Please run: pip install nfl_data_py scikit-learn pandas numpy requests")
     st.stop()
@@ -441,7 +442,7 @@ def load_nfl_data():
                 if not train_clean.empty:
                     clf = LogisticRegression()
                     # WEIGHT: 3x for current season
-                    train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else (1.0 if x == current_year - 1 else 0.5))
+                    train_clean['weight'] = train_clean['season'].map(lambda x: 3.0 if x == current_year else 1.0)
                     clf.fit(train_clean[['logit_mkt', 'diff_net_pass', 'diff_net_rush']], train_clean['home_win'], sample_weight=train_clean['weight'])
 
     return clf, team_stats, weekly, sched, qb_stats, hfa_dict, status, loaded_years, analysis_db
@@ -761,12 +762,12 @@ def render_game_card(i, row, bankroll, kelly):
                 pick_team = home
                 pick_prob = final_p_home
                 pick_odds = dhl
-                mkt_ref = pmkt 
+                mkt_ref = pmkt # Home market prob
             else:
                 pick_team = away
                 pick_prob = 1.0 - final_p_home
                 pick_odds = dal
-                mkt_ref = 1.0 - pmkt 
+                mkt_ref = 1.0 - pmkt # Away market prob
             
             p_be = 1 / pick_odds
             edge = pick_prob - p_be
