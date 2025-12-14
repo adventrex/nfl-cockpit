@@ -235,7 +235,7 @@ def load_nfl_data():
     pbp = pd.concat(pbp_all, ignore_index=True) if pbp_all else pd.DataFrame()
     weekly = pd.concat(weekly_all, ignore_index=True) if weekly_all else pd.DataFrame()
 
-    clf, team_stats_season, qb_stats = None, pd.DataFrame(), pd.DataFrame()
+    clf, team_stats, qb_stats = None, pd.DataFrame(), pd.DataFrame()
     val_accuracy = 0.0
 
     if not pbp.empty:
