@@ -72,7 +72,7 @@ LOADING_HTML = """
 </html>
 """
 
-# --- INITIALIZE LOADING (Now safe because imports are done) ---
+# --- INITIALIZE LOADING ---
 loading_placeholder = st.empty()
 with loading_placeholder:
     components.html(LOADING_HTML, height=450)
@@ -135,7 +135,6 @@ def half_kelly(p, d, bankroll, max_fraction=0.05):
     q = 1 - p
     f_full = (b * p - q) / b
     if f_full <= 0: return 0.0
-    
     f_half = f_full * 0.5
     f_final = min(f_half, max_fraction)
     return f_final * bankroll
@@ -258,6 +257,7 @@ def load_nfl_data():
 
         # 3. Merge
         game_stats = pd.merge(off_stats, def_stats, on=['game_id', 'team', 'season', 'week'], how='outer')
+        game_stats = game_stats.drop_duplicates(subset=['season', 'week', 'team'])
         game_stats = game_stats.sort_values(['team', 'game_date'])
 
         # 4. Rolling
@@ -296,6 +296,9 @@ def load_nfl_data():
                 games_train = games_train[games_train['gameday'] <= last_played_date]
                 games_train['home_win'] = (games_train['home_score'] > games_train['away_score']).astype(int)
                 
+                # Deduplicate schedule if needed
+                games_train = games_train.drop_duplicates(subset=['season', 'week', 'home_team', 'away_team'])
+
                 # Merge Rolling Stats
                 model_stats = game_stats[['season', 'week', 'team'] + [f'rolling_{c}' for c in cols_to_roll]].copy()
                 
@@ -313,6 +316,9 @@ def load_nfl_data():
                     how='left', 
                     suffixes=('', '_away')
                 ).rename(columns={f'rolling_{c}': f'away_{c}' for c in cols_to_roll})
+                
+                # Drop rows where stats missing
+                games_train = games_train.dropna(subset=[f'home_{c}' for c in cols_to_roll] + [f'away_{c}' for c in cols_to_roll])
 
                 # Diffs
                 games_train['diff_pass'] = (games_train['home_off_pass_epa'] - games_train['away_def_pass_epa']) - \
@@ -426,13 +432,16 @@ class CockpitEngine:
             h = team_stats_db[team_stats_db['team']==row['home_team']].sort_values('season', ascending=False).head(1)
             a = team_stats_db[team_stats_db['team']==row['away_team']].sort_values('season', ascending=False).head(1)
             if not h.empty and not a.empty:
-                h_net_p = h['epa_pass_off'].values[0] - a['epa_pass_def'].values[0]
-                a_net_p = a['epa_pass_off'].values[0] - h['epa_pass_def'].values[0]
-                base_dp = h_net_p - a_net_p
-                
-                h_net_r = h['epa_rush_off'].values[0] - a['epa_rush_def'].values[0]
-                a_net_r = a['epa_rush_off'].values[0] - h['epa_rush_def'].values[0]
-                base_dr = h_net_r - a_net_r
+                # Use standard aggregate cols we created
+                # Columns are epa_pass_off, epa_pass_def, etc.
+                if 'epa_pass_off' in h.columns and 'epa_pass_def' in a.columns:
+                    h_net_p = h['epa_pass_off'].values[0] - a['epa_pass_def'].values[0]
+                    a_net_p = a['epa_pass_off'].values[0] - h['epa_pass_def'].values[0]
+                    base_dp = h_net_p - a_net_p
+                    
+                    h_net_r = h['epa_rush_off'].values[0] - a['epa_rush_def'].values[0]
+                    a_net_r = a['epa_rush_off'].values[0] - h['epa_rush_def'].values[0]
+                    base_dr = h_net_r - a_net_r
 
         user_adj_p = (hp + hd) - (ap + ad)
         user_adj_r = (hr + hd) - (ar + ad)
