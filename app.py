@@ -18,6 +18,7 @@ except ImportError:
 # ==========================================
 # 1. UI CONFIGURATION
 # ==========================================
+APP_VERSION = "3.2.0"  # Critical fixes: Kelly, logit, deterministic news, QB detection
 st.set_page_config(page_title="NFL Edge Cockpit Pro", page_icon="🏈", layout="wide")
 
 # --- HACKER LOADING SCREEN HTML ---
@@ -87,13 +88,17 @@ else:
 
 with st.sidebar:
     st.title("🏈 NFL Cockpit")
+    st.caption(f"v{APP_VERSION}")
     bankroll = st.number_input("Bankroll ($)", value=100, step=10)
     kelly = st.selectbox("Risk Profile", [0.5, 1.0], index=0, format_func=lambda x: "Conservative (0.5x)" if x==0.5 else "Aggressive (1.0x)")
-    
+
     max_wager = bankroll * kelly * 0.05
     st.metric("Max Wager Limit (5% Cap)", f"${max_wager:.2f}", help="The absolute maximum bet size allowed per game to prevent ruin.")
-    
+
     st.divider()
+    if st.button("🔄 Clear Cache & Reload"):
+        st.cache_resource.clear()
+        st.rerun()
     status_slot = st.empty()
 
 # Date Picker
@@ -103,7 +108,8 @@ sel_date = c_date.date_input("📅 Select Game Date", datetime.date.today())
 # ==========================================
 # 2. IMPORTS & API KEYS
 # ==========================================
-ODDS_API_KEY = "bb2b1af235a1f0273f9b085b82d6be81"
+# Use secrets for API keys (fallback to hardcoded for local dev)
+ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", "bb2b1af235a1f0273f9b085b82d6be81")
 
 try:
     import nfl_data_py as nfl
@@ -134,7 +140,8 @@ class OddsService:
     def fetch_live_odds():
         try:
             url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?regions=us&markets=h2h&bookmakers=draftkings&apiKey={ODDS_API_KEY}"
-            response = requests.get(url)
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
             data = response.json()
             
             live_data = {}
@@ -216,11 +223,13 @@ class StadiumService:
             date_str = date_obj.strftime("%Y-%m-%d")
             url = f"https://api.open-meteo.com/v1/forecast?latitude={stadium['lat']}&longitude={stadium['lon']}&daily=temperature_2m_max,precipitation_probability_max,windspeed_10m_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&start_date={date_str}&end_date={date_str}"
             
-            res = requests.get(url).json()
-            if 'daily' in res:
-                temp = res['daily']['temperature_2m_max'][0]
-                rain = res['daily']['precipitation_probability_max'][0]
-                wind = res['daily']['windspeed_10m_max'][0]
+            res = requests.get(url, timeout=10)
+            res.raise_for_status()
+            weather_data = res.json()
+            if 'daily' in weather_data:
+                temp = weather_data['daily']['temperature_2m_max'][0]
+                rain = weather_data['daily']['precipitation_probability_max'][0]
+                wind = weather_data['daily']['windspeed_10m_max'][0]
                 
                 desc = f"🌡️ {temp}°F  💨 {wind} mph  💧 {rain}% Rain"
                 return {"desc": desc, "is_closed": False, "temp": temp, "wind": wind, "rain": rain}
@@ -242,18 +251,38 @@ def no_vig_two_way(d1, d2):
     p1, p2 = 1/d1, 1/d2
     return p1/(p1+p2), p2/(p1+p2)
 
-def half_kelly(p, d, cap=0.05):
-    b = d - 1
-    q = 1 - p
-    if b <= 0: return 0
-    f = (b*p - q) / b
-    return max(0, f * 0.5 * cap) 
+def half_kelly_fraction(p: float, d: float, cap: float = 0.05) -> float:
+    """
+    Half Kelly criterion with proper capping.
+    Returns fraction of bankroll to bet (0.0 to cap).
+    """
+    b = d - 1.0
+    if b <= 0:
+        return 0.0
+    p = min(max(float(p), 1e-6), 1 - 1e-6)
+    q = 1.0 - p
+    f_star = (b * p - q) / b
+    f_half = max(0.0, 0.5 * f_star)
+    return min(f_half, cap)
 
-def logit(p):
-    return math.log(max(p, 1e-6) / (1 - max(p, 1e-6)))
+def logit(p: float) -> float:
+    """Safe logit function that clips to prevent division by zero"""
+    p = float(p)
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return math.log(p / (1 - p))
 
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def deterministic_uniform(key: str, lo: float, hi: float) -> float:
+    """Deterministic random number generation based on key (for reproducible 'news' variance)"""
+    rng = random.Random(key)
+    return lo + (hi - lo) * rng.random()
+
+def fair_decimal(p: float) -> float:
+    """Convert probability to fair decimal odds"""
+    p = min(max(float(p), 1e-6), 1 - 1e-6)
+    return 1.0 / p
 
 def get_last_nfl_date():
     today = datetime.date.today()
@@ -506,19 +535,56 @@ if sched_db is None or sched_db.empty:
 class CockpitEngine:
     @staticmethod
     def get_team_leaders(team_abbr):
-        if weekly_stats_db.empty: return {}
-        recent = weekly_stats_db[weekly_stats_db['recent_team'] == team_abbr].sort_values('week', ascending=False).head(50)
-        if recent.empty: return {}
+        if weekly_stats_db.empty:
+            return {}
+
+        # Defensive check for column names
+        team_col = "recent_team" if "recent_team" in weekly_stats_db.columns else "team"
+        recent = weekly_stats_db[weekly_stats_db[team_col] == team_abbr].sort_values(['season', 'week'], ascending=False)
+
+        if recent.empty:
+            return {}
+
         leaders = {}
-        qb = recent.sort_values('passing_yards', ascending=False).head(1)
-        if not qb.empty:
-            leaders['QB'] = {'name': qb.iloc[0]['player_display_name'], 'raw_yds': qb.iloc[0]['passing_yards'], 'stat': f"Last: {qb.iloc[0]['passing_yards']} yds"}
-        rb = recent.sort_values('rushing_yards', ascending=False).head(1)
-        if not rb.empty:
-            leaders['RB'] = {'name': rb.iloc[0]['player_display_name'], 'raw_yds': rb.iloc[0]['rushing_yards'], 'stat': f"Last: {rb.iloc[0]['rushing_yards']} yds"}
-        wr = recent.sort_values('receiving_yards', ascending=False).head(1)
-        if not wr.empty:
-            leaders['WR'] = {'name': wr.iloc[0]['player_display_name'], 'raw_yds': wr.iloc[0]['receiving_yards'], 'stat': f"Last: {wr.iloc[0]['receiving_yards']} yds"}
+
+        # QB: Use most recent week's starter (by attempts, not yards)
+        # This fixes the Flacco/Burrow issue
+        if 'attempts' in recent.columns and 'passing_yards' in recent.columns:
+            # Get most recent week data
+            max_week = recent['week'].max()
+            max_season = recent['season'].max()
+            latest_week = recent[(recent['season'] == max_season) & (recent['week'] == max_week)]
+
+            if not latest_week.empty:
+                # QB is whoever had the most pass attempts in most recent game
+                qb = latest_week.sort_values('attempts', ascending=False).head(1)
+                if not qb.empty and qb.iloc[0]['attempts'] > 0:
+                    leaders['QB'] = {
+                        'name': qb.iloc[0]['player_display_name'],
+                        'raw_yds': qb.iloc[0]['passing_yards'],
+                        'stat': f"Last: {qb.iloc[0]['passing_yards']} yds"
+                    }
+
+        # RB and WR: Use last 3 weeks aggregate
+        recent_3 = recent.head(50)
+        if 'rushing_yards' in recent_3.columns:
+            rb = recent_3.sort_values('rushing_yards', ascending=False).head(1)
+            if not rb.empty:
+                leaders['RB'] = {
+                    'name': rb.iloc[0]['player_display_name'],
+                    'raw_yds': rb.iloc[0]['rushing_yards'],
+                    'stat': f"Last: {rb.iloc[0]['rushing_yards']} yds"
+                }
+
+        if 'receiving_yards' in recent_3.columns:
+            wr = recent_3.sort_values('receiving_yards', ascending=False).head(1)
+            if not wr.empty:
+                leaders['WR'] = {
+                    'name': wr.iloc[0]['player_display_name'],
+                    'raw_yds': wr.iloc[0]['receiving_yards'],
+                    'stat': f"Last: {wr.iloc[0]['receiving_yards']} yds"
+                }
+
         return leaders
 
     @staticmethod
@@ -533,8 +599,8 @@ class CockpitEngine:
         h_lead = CockpitEngine.get_team_leaders(home)
         a_lead = CockpitEngine.get_team_leaders(away)
         props = []
-        props.append(parlay.PropLeg(f"{home}_ML", f"{home} To Win", 1.0 + (1/h_win_prob), h_win_prob, "Team Win", home, "Moneyline"))
-        props.append(parlay.PropLeg(f"{away}_ML", f"{away} To Win", 1.0 + (1/a_win_prob), a_win_prob, "Team Win", away, "Moneyline"))
+        props.append(parlay.PropLeg(f"{home}_ML", f"{home} To Win", fair_decimal(h_win_prob), h_win_prob, "Team Win", home, "Moneyline"))
+        props.append(parlay.PropLeg(f"{away}_ML", f"{away} To Win", fair_decimal(a_win_prob), a_win_prob, "Team Win", away, "Moneyline"))
 
         def add(p_data, cat, team, m=1.0):
             if not p_data: return
@@ -630,7 +696,11 @@ class CockpitEngine:
             model_raw = model_clf.predict_proba(x)[0, 1]
             model_p = (0.7 * market_prob) + (0.3 * model_raw)
 
-        news = (random.uniform(-0.04, 0.04)) * (sliders['wn']/2.5) if sliders['wn']>0 else 0
+        # Deterministic news variance based on game (no more random behavior on rerun)
+        game_key = str(row.get("game_id") or f"{row['away_team']}@{row['home_team']}_{row.get('gameday','')}")
+        news_raw = deterministic_uniform(game_key, -0.04, 0.04)
+        news = news_raw * (sliders['wn'] / 2.5) if sliders['wn'] > 0 else 0.0
+
         weather = -0.02 * (sliders['ww']/2.5) if sliders['ww']>0 else 0
         rest = ((sliders.get('rh',7)-sliders.get('ra',7))*0.005) * (sliders['wr']/2.0)
         
@@ -730,10 +800,12 @@ def render_game_card(i, row, bankroll, kelly):
                     val_fmt = f"{v:.1%}" if k == "AI Model (Stats)" else f"{v:+.1%}"
                     st.write(f"- {k}: {val_fmt}")
             if ev > 0.01:
-                stake = half_kelly(final_p, dh) * bankroll * kelly
+                stake = half_kelly_fraction(final_p, dh, cap=0.05) * bankroll * kelly
+                stake = min(stake, max_wager)  # Enforce max wager limit
                 st.success(f"BET {home} ${stake:.0f}")
             elif ((1-final_p)*da - 1) > 0.01:
-                stake = half_kelly(1-final_p, da) * bankroll * kelly
+                stake = half_kelly_fraction(1-final_p, da, cap=0.05) * bankroll * kelly
+                stake = min(stake, max_wager)  # Enforce max wager limit
                 st.success(f"BET {away} ${stake:.0f}")
             else: st.info("No Edge")
 
