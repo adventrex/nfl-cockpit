@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.env
+bet_log.csv
+nfl_stats_*.csv
+.pytest_cache/
+.DS_Store
+data/
+picker_data/
